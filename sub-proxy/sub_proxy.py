@@ -20,6 +20,7 @@ import base64
 import json
 import logging
 import os
+import posixpath
 import re
 import sys
 import urllib.parse
@@ -56,6 +57,12 @@ XUI_ADDRESSES = [a.strip() for a in XUI_ADDRESSES_RAW.split(",") if a.strip()]
 
 # Таймаут запроса к 3x-ui (секунды)
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "10"))
+
+# Максимальный размер ответа от upstream (байты, защита от OOM)
+MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))  # 5 MB
+
+# Разрешённый префикс пути (должен совпадать с nginx location)
+ALLOWED_PATH_PREFIX = os.environ.get("ALLOWED_PATH_PREFIX", "/xui-sub/")
 
 # ── Логирование ─────────────────────────────────────────────────────────────
 
@@ -129,10 +136,13 @@ def _replace_vmess(uri: str) -> str:
         if config.get("sni") in XUI_ADDRESSES:
             config["sni"] = RELAY_ADDRESS
 
-        # Замена порта
+        # Замена порта (vmess ожидает int)
         port_str = str(config.get("port", ""))
         if port_str in PORT_MAP:
-            config["port"] = PORT_MAP[port_str]
+            try:
+                config["port"] = int(PORT_MAP[port_str])
+            except ValueError:
+                config["port"] = PORT_MAP[port_str]
 
         new_json = json.dumps(config, ensure_ascii=False)
         new_b64 = base64.b64encode(new_json.encode()).decode()
@@ -193,13 +203,64 @@ def transform_subscription(raw_body: bytes, content_type: str = "") -> bytes:
 
 # ── HTTP Handler ────────────────────────────────────────────────────────────
 
+def _sanitize_path(raw_path: str) -> str | None:
+    """Валидация и нормализация пути. Возвращает None если путь подозрительный."""
+    # Декодируем percent-encoding для проверки
+    try:
+        decoded = urllib.parse.unquote(raw_path)
+    except Exception:
+        return None
+
+    # Запрещаем null-байты
+    if "\x00" in decoded or "\x00" in raw_path:
+        return None
+
+    # Нормализуем путь (убираем ../, //, и т.д.)
+    normalized = posixpath.normpath(decoded)
+
+    # Путь должен начинаться с разрешённого префикса
+    if not normalized.startswith(ALLOWED_PATH_PREFIX.rstrip("/")):
+        return None
+
+    # Запрещаем символы, которых не должно быть в пути подписки
+    # Разрешаем: буквы, цифры, -, _, /, .
+    if re.search(r"[^a-zA-Z0-9\-_/.]", normalized):
+        return None
+
+    return normalized
+
+
+def _mask_token(path: str) -> str:
+    """Маскирует токен в пути для безопасного логирования."""
+    parts = path.rstrip("/").split("/")
+    if len(parts) > 0:
+        token = parts[-1]
+        if len(token) > 8:
+            parts[-1] = token[:4] + "****" + token[-4:]
+        elif len(token) > 0:
+            parts[-1] = "****"
+    return "/".join(parts)
+
+
 class SubProxyHandler(BaseHTTPRequestHandler):
     """Обрабатывает GET-запросы к подписке."""
 
+    # Скрываем версию сервера
+    server_version = "proxy"
+    sys_version = ""
+
     def do_GET(self):
+        # ── Валидация пути (защита от SSRF / path traversal) ──
+        safe_path = _sanitize_path(self.path)
+        if safe_path is None:
+            log.warning("Blocked suspicious path from %s: %s",
+                        self.address_string(), self.path[:200])
+            self.send_error(400, "Bad Request")
+            return
+
         # Формируем URL к 3x-ui
-        upstream_url = XUI_SUB_BASE_URL.rstrip("/") + self.path
-        log.info("→ %s", upstream_url)
+        upstream_url = XUI_SUB_BASE_URL.rstrip("/") + safe_path
+        log.info("→ %s (from %s)", _mask_token(safe_path), self.address_string())
 
         try:
             req = urllib.request.Request(
@@ -207,15 +268,29 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                 headers={"User-Agent": self.headers.get("User-Agent", "SubProxy/1.0")},
             )
             resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT, context=ssl_ctx)
-            body = resp.read()
+
+            # Ограничение размера ответа (защита от OOM)
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_RESPONSE_SIZE:
+                log.error("Upstream response too large: %s bytes", content_length)
+                self.send_error(502, "Bad Gateway")
+                return
+
+            body = resp.read(MAX_RESPONSE_SIZE + 1)
+            if len(body) > MAX_RESPONSE_SIZE:
+                log.error("Upstream response exceeded size limit")
+                self.send_error(502, "Bad Gateway")
+                return
+
             ct = resp.headers.get("Content-Type", "")
             status = resp.status
         except urllib.error.HTTPError as e:
-            log.error("Upstream HTTP %d: %s", e.code, e.reason)
-            self.send_error(e.code, e.reason)
+            log.error("Upstream HTTP %d for %s", e.code, _mask_token(safe_path))
+            # Не пробрасываем reason от upstream — может содержать внутреннюю информацию
+            self.send_error(e.code if e.code in (400, 404) else 502, "Error")
             return
         except Exception as e:
-            log.error("Upstream error: %s", e)
+            log.error("Upstream error: %s", type(e).__name__)
             self.send_error(502, "Bad Gateway")
             return
 
@@ -226,6 +301,14 @@ class SubProxyHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ct or "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(transformed)))
+
+        # ── Заголовки безопасности ──
+        # Подписка содержит VPN-credentials — запрещаем кеширование
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+
         # Пробрасываем заголовки подписки (profile-update-interval и т.д.)
         for hdr in ("subscription-userinfo", "profile-update-interval",
                      "content-disposition", "profile-title"):
