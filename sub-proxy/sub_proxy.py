@@ -33,8 +33,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 LISTEN_HOST = os.environ.get("SUB_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SUB_PROXY_PORT", "9080"))
 
-# URL подписки на 3x-ui сервере (без токена)
-# Пример: https://44.44.44.44:2096/sub/
+# URL подписки на 3x-ui сервере (включая путь подписки, без токена)
+# Пример: https://44-44-44-44.sslip.io/Rwdds1XehitLaIPO
+# sub_proxy.py добавит токен клиента к этому URL
 XUI_SUB_BASE_URL = os.environ["XUI_SUB_BASE_URL"]
 
 # Домен/IP relay-сервера (будет подставлен в подписку вместо 3x-ui)
@@ -73,12 +74,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("sub-proxy")
 
+# Проверка SSL-сертификата upstream (3x-ui)
+# По умолчанию выключена — 3x-ui обычно использует самоподписанный сертификат
+UPSTREAM_SSL_VERIFY = os.environ.get("UPSTREAM_SSL_VERIFY", "false").lower() in ("true", "1", "yes")
+
 # ── SSL контекст для запросов к upstream ────────────────────────────────────
 
 ssl_ctx = ssl.create_default_context()
-# Если 3x-ui использует самоподписанный сертификат — раскомментировать:
-# ssl_ctx.check_hostname = False
-# ssl_ctx.verify_mode = ssl.CERT_NONE
+if not UPSTREAM_SSL_VERIFY:
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
 # ── Утилиты ─────────────────────────────────────────────────────────────────
@@ -258,8 +263,10 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad Request")
             return
 
-        # Формируем URL к 3x-ui
-        upstream_url = XUI_SUB_BASE_URL.rstrip("/") + safe_path
+        # Формируем URL к 3x-ui: стрипаем relay-префикс, оставляем только токен
+        prefix = ALLOWED_PATH_PREFIX.rstrip("/")
+        relative_path = safe_path[len(prefix):] if safe_path.startswith(prefix) else safe_path
+        upstream_url = XUI_SUB_BASE_URL.rstrip("/") + relative_path
         log.info("→ %s (from %s)", _mask_token(safe_path), self.address_string())
 
         try:
@@ -331,6 +338,7 @@ def main():
     log.info("  Relay addr: %s", RELAY_ADDRESS)
     log.info("  Port map:   %s", PORT_MAP or "(none)")
     log.info("  XUI addrs:  %s", XUI_ADDRESSES)
+    log.info("  SSL verify: %s", UPSTREAM_SSL_VERIFY)
 
     server = HTTPServer((LISTEN_HOST, LISTEN_PORT), SubProxyHandler)
     try:
