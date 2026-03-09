@@ -261,6 +261,14 @@ class SubProxyHandler(BaseHTTPRequestHandler):
         # Формируем URL к 3x-ui: стрипаем relay-префикс, оставляем только токен
         prefix = ALLOWED_PATH_PREFIX.rstrip("/")
         relative_path = safe_path[len(prefix):] if safe_path.startswith(prefix) else safe_path
+
+        # Дедупликация: если клиент включил sub_path в URL
+        # (например /xui-sub/Rc1Xsf0KArGtLaIPO/token вместо /xui-sub/token),
+        # а XUI_SUB_BASE_URL уже содержит /Rc1Xsf0KArGtLaIPO — убираем дубль
+        base_path = urllib.parse.urlparse(XUI_SUB_BASE_URL).path.rstrip("/")
+        if base_path and relative_path.startswith(base_path):
+            relative_path = relative_path[len(base_path):]
+
         upstream_url = XUI_SUB_BASE_URL.rstrip("/") + relative_path
         log.info("→ %s (from %s)", _mask_token(safe_path), self.address_string())
 
