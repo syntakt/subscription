@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Subscription Relay — Setup Script
+# Subscription Relay Proxy — Setup
 # =============================================================================
-# Устанавливает и настраивает nginx на relay-сервере для:
-#   1. Проксирования подписки с подменой адресов (sub_filter)
-#   2. Проброса VPN-трафика (stream)
+# Устанавливает sub_proxy.py как systemd-сервис на relay-сервере.
+#
+# Что делает:
+#   1. Копирует sub_proxy.py и .env в /opt/sub-proxy/
+#   2. Устанавливает systemd unit
+#   3. Запускает сервис
+#   4. Показывает пример nginx location для добавления в конфиг
 #
 # Использование:
 #   1. Заполнить .env (скопировать из env.example)
@@ -14,121 +18,78 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="/opt/sub-proxy"
 
-# ── Загрузка .env ────────────────────────────────────────────────────────────
-ENV_FILE="${SCRIPT_DIR}/.env"
-if [[ ! -f "$ENV_FILE" ]]; then
+# ── Проверка .env ────────────────────────────────────────────────────────────
+if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
     echo "ERROR: Файл .env не найден."
-    echo "Скопируйте env.example → .env и заполните значения:"
     echo "  cp ${SCRIPT_DIR}/env.example ${SCRIPT_DIR}/.env"
+    echo "  nano ${SCRIPT_DIR}/.env"
     exit 1
 fi
 
+# Проверка обязательных переменных
 set -a
-source "$ENV_FILE"
+source "${SCRIPT_DIR}/.env"
 set +a
 
-# ── Проверка обязательных переменных ──────────────────────────────────────────
-REQUIRED_VARS=(RELAY_DOMAIN RELAY_IP XUI_HOST XUI_IP XUI_SUB_PORT SUB_PATH RELAY_VLESS_PORT XUI_VLESS_PORT)
-for var in "${REQUIRED_VARS[@]}"; do
+for var in XUI_SUB_BASE_URL RELAY_ADDRESS XUI_ADDRESSES; do
     if [[ -z "${!var:-}" ]]; then
         echo "ERROR: Переменная $var не задана в .env"
         exit 1
     fi
 done
 
-echo "=== Subscription Relay Setup ==="
-echo "Relay:  ${RELAY_DOMAIN} (${RELAY_IP})"
-echo "3x-ui:  ${XUI_HOST}"
+echo "=== Subscription Relay Proxy Setup ==="
+echo "  Upstream:    ${XUI_SUB_BASE_URL}"
+echo "  Relay addr:  ${RELAY_ADDRESS}"
+echo "  XUI addrs:   ${XUI_ADDRESSES}"
+echo "  Port map:    ${PORT_MAP:-none}"
+echo "  Listen:      ${SUB_PROXY_HOST:-127.0.0.1}:${SUB_PROXY_PORT:-9080}"
 echo ""
 
-# ── Установка nginx (если не установлен) ──────────────────────────────────────
-if ! command -v nginx &>/dev/null; then
-    echo "[1/5] Устанавливаю nginx..."
-    apt-get update -qq
-    apt-get install -y -qq nginx libnginx-mod-stream
+# ── Установка файлов ─────────────────────────────────────────────────────────
+echo "[1/3] Копирую файлы в ${INSTALL_DIR}..."
+mkdir -p "${INSTALL_DIR}"
+cp "${SCRIPT_DIR}/sub-proxy/sub_proxy.py" "${INSTALL_DIR}/sub_proxy.py"
+cp "${SCRIPT_DIR}/.env" "${INSTALL_DIR}/.env"
+chmod 600 "${INSTALL_DIR}/.env"
+chmod 644 "${INSTALL_DIR}/sub_proxy.py"
+echo "  → ${INSTALL_DIR}/sub_proxy.py"
+echo "  → ${INSTALL_DIR}/.env"
+
+# ── Установка systemd unit ───────────────────────────────────────────────────
+echo "[2/3] Устанавливаю systemd сервис..."
+cp "${SCRIPT_DIR}/sub-proxy/sub-proxy.service" /etc/systemd/system/sub-proxy.service
+systemctl daemon-reload
+systemctl enable sub-proxy
+systemctl restart sub-proxy
+echo "  → systemctl status sub-proxy"
+
+# ── Проверка ─────────────────────────────────────────────────────────────────
+echo "[3/3] Проверяю..."
+sleep 1
+if systemctl is-active --quiet sub-proxy; then
+    echo "  ✓ sub-proxy запущен"
 else
-    echo "[1/5] nginx уже установлен"
-    # Убедимся что модуль stream установлен
-    if ! dpkg -l | grep -q libnginx-mod-stream; then
-        apt-get install -y -qq libnginx-mod-stream
-    fi
-fi
-
-# ── Получение SSL-сертификата ─────────────────────────────────────────────────
-echo "[2/5] Настраиваю SSL-сертификат..."
-if [[ ! -f "/etc/letsencrypt/live/${RELAY_DOMAIN}/fullchain.pem" ]]; then
-    if ! command -v certbot &>/dev/null; then
-        apt-get install -y -qq certbot
-    fi
-    # Останавливаем nginx если запущен, чтобы certbot мог использовать порт 80
-    systemctl stop nginx 2>/dev/null || true
-    certbot certonly --standalone -d "${RELAY_DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email
-    systemctl start nginx 2>/dev/null || true
-    echo "  SSL-сертификат получен"
-else
-    echo "  SSL-сертификат уже существует"
-fi
-
-# ── Генерация nginx конфигов из шаблонов ──────────────────────────────────────
-echo "[3/5] Генерирую конфиги nginx..."
-
-# HTTP — подписка с sub_filter
-envsubst '${RELAY_DOMAIN} ${XUI_HOST} ${XUI_IP} ${XUI_SUB_PORT} ${SUB_PATH} ${RELAY_IP}' \
-    < "${SCRIPT_DIR}/nginx/conf.d/subscription-relay.conf" \
-    > /etc/nginx/conf.d/subscription-relay.conf
-
-echo "  → /etc/nginx/conf.d/subscription-relay.conf"
-
-# Stream — VPN-трафик
-envsubst '${XUI_HOST} ${RELAY_VLESS_PORT} ${XUI_VLESS_PORT} ${RELAY_VMESS_PORT:-} ${XUI_VMESS_PORT:-}' \
-    < "${SCRIPT_DIR}/nginx/stream.d/relay-traffic.conf" \
-    > /etc/nginx/stream.d/relay-traffic.conf 2>/dev/null || true
-
-echo "  → /etc/nginx/stream.d/relay-traffic.conf"
-
-# ── Подключение stream в nginx.conf если ещё нет ──────────────────────────────
-echo "[4/5] Проверяю подключение stream модуля..."
-
-NGINX_CONF="/etc/nginx/nginx.conf"
-mkdir -p /etc/nginx/stream.d
-
-if ! grep -q 'stream.d' "$NGINX_CONF"; then
-    # Добавляем блок stream в конец nginx.conf
-    cat >> "$NGINX_CONF" <<'STREAM_BLOCK'
-
-# === Subscription Relay: Stream (L4 proxy) ===
-stream {
-    include /etc/nginx/stream.d/*.conf;
-}
-STREAM_BLOCK
-    echo "  Блок stream добавлен в nginx.conf"
-else
-    echo "  Блок stream уже подключен"
-fi
-
-# ── Проверка и перезапуск ─────────────────────────────────────────────────────
-echo "[5/5] Проверяю и перезапускаю nginx..."
-
-if nginx -t 2>&1; then
-    systemctl reload nginx
-    echo ""
-    echo "=== Готово! ==="
-    echo ""
-    echo "Подписка доступна по адресу:"
-    echo "  https://${RELAY_DOMAIN}${SUB_PATH}<token>"
-    echo ""
-    echo "VPN-трафик relay:"
-    echo "  ${RELAY_DOMAIN}:${RELAY_VLESS_PORT} → ${XUI_HOST}:${XUI_VLESS_PORT}"
-    echo ""
-    echo "Клиент должен использовать ссылку подписки с доменом ${RELAY_DOMAIN}."
-    echo "При обновлении подписки в конфиге клиента будет адрес ${RELAY_DOMAIN},"
-    echo "а VPN-трафик пойдёт через relay-сервер."
-else
-    echo ""
-    echo "ERROR: nginx config test failed!"
-    echo "Проверьте конфиги вручную:"
-    echo "  /etc/nginx/conf.d/subscription-relay.conf"
-    echo "  /etc/nginx/stream.d/relay-traffic.conf"
+    echo "  ✗ sub-proxy не запустился!"
+    echo "  Смотрите: journalctl -u sub-proxy -n 20"
     exit 1
 fi
+
+echo ""
+echo "=== Готово! ==="
+echo ""
+echo "Добавьте в nginx конфиг (server { listen 5443 ssl; ... }):"
+echo "─────────────────────────────────────────────────────────"
+cat "${SCRIPT_DIR}/nginx/conf.d/subscription-relay.conf"
+echo "─────────────────────────────────────────────────────────"
+echo ""
+echo "После добавления:"
+echo "  nginx -t && systemctl reload nginx"
+echo ""
+echo "Ссылка подписки для клиента:"
+echo "  https://${RELAY_ADDRESS}:5443/xui-sub/<TOKEN>"
+echo ""
+echo "Тест:"
+echo "  curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | base64 -d"
