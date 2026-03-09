@@ -101,10 +101,10 @@ def replace_address_in_uri(uri: str) -> str:
         if xui_addr not in uri:
             continue
 
-        # Заменяем address в host части
+        # Заменяем только address в host части (protocol://uuid@address:port)
+        # Query-параметры (sni, host) остаются оригинальными —
+        # relay пробрасывает TCP, TLS/REALITY хендшейк идёт с origin
         uri = uri.replace(f"@{xui_addr}:", f"@{RELAY_ADDRESS}:")
-        # Заменяем в query-параметрах (sni, host и т.д.)
-        uri = uri.replace(xui_addr, RELAY_ADDRESS)
 
     # Заменяем порты
     for src_port, dst_port in PORT_MAP.items():
@@ -129,17 +129,12 @@ def _replace_vmess(uri: str) -> str:
         raw = base64.b64decode(b64_part)
         config = json.loads(raw)
 
-        # Замена address
+        # Замена address (куда подключается клиент)
         if config.get("add") in XUI_ADDRESSES:
             config["add"] = RELAY_ADDRESS
 
-        # Замена host (для WebSocket/HTTP/2)
-        if config.get("host") in XUI_ADDRESSES:
-            config["host"] = RELAY_ADDRESS
-
-        # Замена SNI
-        if config.get("sni") in XUI_ADDRESSES:
-            config["sni"] = RELAY_ADDRESS
+        # host и sni НЕ заменяем — relay пробрасывает TCP,
+        # TLS/REALITY хендшейк идёт напрямую с origin-сервером
 
         # Замена порта (vmess ожидает int)
         port_str = str(config.get("port", ""))
