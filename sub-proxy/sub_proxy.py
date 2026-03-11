@@ -249,14 +249,24 @@ def transform_subscription(raw_body: bytes, content_type: str, srv: ServerConfig
 
 # ── HTTP Handler ────────────────────────────────────────────────────────────
 
-def _sanitize_path(raw_path: str, allowed_prefixes: list[str]) -> str | None:
-    """Валидация и нормализация пути. Возвращает None если путь подозрительный."""
+def _sanitize_path(raw_path: str, allowed_prefixes: list[str]) -> tuple[str, str] | None:
+    """Валидация и нормализация пути.
+
+    Возвращает (normalized_path, query_string) или None если путь подозрительный.
+    Query string отделяется до валидации — он пробрасывается к upstream как есть.
+    """
+    # Разделяем path и query string
+    if "?" in raw_path:
+        path_part, query_string = raw_path.split("?", 1)
+    else:
+        path_part, query_string = raw_path, ""
+
     try:
-        decoded = urllib.parse.unquote(raw_path)
+        decoded = urllib.parse.unquote(path_part)
     except Exception:
         return None
 
-    if "\x00" in decoded or "\x00" in raw_path:
+    if "\x00" in decoded or "\x00" in path_part:
         return None
 
     normalized = posixpath.normpath(decoded)
@@ -268,11 +278,17 @@ def _sanitize_path(raw_path: str, allowed_prefixes: list[str]) -> str | None:
     if re.search(r"[^a-zA-Z0-9\-_/.]", normalized):
         return None
 
-    return normalized
+    # Валидация query string: только безопасные символы
+    # Разрешаем: буквы, цифры, -, _, ., =, &, % (percent-encoding)
+    if query_string and re.search(r"[^a-zA-Z0-9\-_.=&%+]", query_string):
+        return None
+
+    return normalized, query_string
 
 
 def _mask_token(path: str) -> str:
-    """Маскирует токен в пути для безопасного логирования."""
+    """Маскирует токен в пути и query для безопасного логирования."""
+    # Маскируем последний сегмент пути
     parts = path.rstrip("/").split("/")
     if len(parts) > 0:
         token = parts[-1]
@@ -280,7 +296,9 @@ def _mask_token(path: str) -> str:
             parts[-1] = token[:4] + "****" + token[-4:]
         elif len(token) > 0:
             parts[-1] = "****"
-    return "/".join(parts)
+    masked = "/".join(parts)
+    # Если есть query — показываем только ключи параметров
+    return masked + "?..." if "?" in path else masked
 
 
 # Собираем список разрешённых префиксов из всех серверов
@@ -295,12 +313,14 @@ class SubProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # ── Валидация пути ──
-        safe_path = _sanitize_path(self.path, ALLOWED_PREFIXES)
-        if safe_path is None:
+        result = _sanitize_path(self.path, ALLOWED_PREFIXES)
+        if result is None:
             log.warning("Blocked suspicious path from %s: %s",
                         self.address_string(), self.path[:200])
             self.send_error(400, "Bad Request")
             return
+
+        safe_path, query_string = result
 
         # ── Роутинг: определяем сервер по префиксу ──
         srv = _find_server(safe_path)
@@ -310,7 +330,7 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
 
-        # Стрипаем prefix, оставляем только токен
+        # Стрипаем prefix, оставляем только токен/путь
         prefix = srv.path_prefix.rstrip("/")
         relative_path = safe_path[len(prefix):] if safe_path.startswith(prefix) else safe_path
 
@@ -320,6 +340,9 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             relative_path = relative_path[len(base_path):]
 
         upstream_url = srv.xui_sub_base_url.rstrip("/") + relative_path
+        # Пробрасываем query string к upstream (для подписок с ?id=...)
+        if query_string:
+            upstream_url += "?" + query_string
         log.info("[%s] → %s (from %s)", srv.name, _mask_token(safe_path), self.address_string())
 
         try:

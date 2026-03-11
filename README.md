@@ -32,10 +32,10 @@
 Один relay может обслуживать подписки с нескольких 3x-ui серверов.
 Каждый сервер доступен через свой path prefix:
 
-| Сервер | Prefix | Ссылка подписки |
-|--------|--------|-----------------|
-| NL | `/xui-sub/` | `https://relay:5443/xui-sub/<token>` |
-| DE | `/xui-sub-de/` | `https://relay:5443/xui-sub-de/<token>` |
+| Сервер | Prefix | Формат подписки | Ссылка подписки |
+|--------|--------|-----------------|-----------------|
+| NL | `/xui-sub/` | токен в пути | `https://relay:5443/xui-sub/<token>` |
+| DE | `/xui-sub-de/` | токен в query | `https://relay:5443/xui-sub-de/?id=<UUID>` |
 
 Роутинг выполняет `sub_proxy.py` — один процесс обрабатывает все серверы.
 
@@ -123,8 +123,8 @@ sudo systemctl restart sub-proxy
 # Тест (NL)
 curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | base64 -d
 
-# Тест (DE)
-curl -sk https://127.0.0.1:5443/xui-sub-de/<TOKEN> | base64 -d
+# Тест (DE, query формат)
+curl -sk "https://127.0.0.1:5443/xui-sub-de/?id=<UUID>" | base64 -d
 ```
 
 ## Добавление нового сервера
