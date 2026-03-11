@@ -451,6 +451,22 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                 return
 
         except urllib.error.HTTPError as e:
+            # 3xx redirect caught as HTTPError (urllib quirk with custom openers)
+            if 300 <= e.code < 400:
+                location = e.headers.get("Location", "")
+                if location:
+                    rewritten = _rewrite_redirect(location, srv)
+                    log.info("[%s] Redirect %d → %s (rewritten, from HTTPError)",
+                             srv.name, e.code, _mask_token(rewritten[:200]))
+                    self.send_response(e.code)
+                    self.send_header("Location", rewritten)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                log.error("[%s] Redirect %d without Location for %s",
+                          srv.name, e.code, _mask_token(safe_path))
+                self.send_error(502, "Bad Gateway")
+                return
             log.error("[%s] Upstream HTTP %d for %s", srv.name, e.code, _mask_token(safe_path))
             self.send_error(e.code if e.code in (400, 404) else 502, "Error")
             return
