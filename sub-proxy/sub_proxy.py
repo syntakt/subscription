@@ -40,14 +40,16 @@ from dataclasses import dataclass, field
 LISTEN_HOST = os.environ.get("SUB_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SUB_PROXY_PORT", "9080"))
 
-# Таймаут запроса к 3x-ui (секунды)
-UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "10"))
+# Таймаут запроса к 3x-ui (секунды, макс 60)
+UPSTREAM_TIMEOUT = min(int(os.environ.get("UPSTREAM_TIMEOUT", "10")), 60)
 
-# Максимальный размер ответа от upstream (байты, защита от OOM)
-MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))  # 5 MB
+# Максимальный размер ответа от upstream (байты, защита от OOM, макс 50 MB)
+MAX_RESPONSE_SIZE = min(int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024))),
+                        50 * 1024 * 1024)
 
 # Проверка SSL-сертификата upstream (3x-ui)
-UPSTREAM_SSL_VERIFY = os.environ.get("UPSTREAM_SSL_VERIFY", "false").lower() in ("true", "1", "yes")
+# По умолчанию включена — отключайте ТОЛЬКО для самоподписанных сертификатов
+UPSTREAM_SSL_VERIFY = os.environ.get("UPSTREAM_SSL_VERIFY", "true").lower() in ("true", "1", "yes")
 
 # ── Логирование ─────────────────────────────────────────────────────────────
 
@@ -62,6 +64,7 @@ log = logging.getLogger("sub-proxy")
 
 ssl_ctx = ssl.create_default_context()
 if not UPSTREAM_SSL_VERIFY:
+    log.warning("⚠ UPSTREAM_SSL_VERIFY=false — upstream certificate NOT verified (MITM risk)")
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
@@ -99,8 +102,12 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
                 if not location:
                     raise
                 resolved = urllib.parse.urljoin(url, location)
-                # App deep links (sing-box://, clash://) — don't follow, let caller handle
-                if not resolved.startswith(("http://", "https://")):
+                # App deep links — don't follow, let caller handle
+                # Only allow known VPN app schemes (block javascript:, data:, file:, etc.)
+                _ALLOWED_APP_SCHEMES = ("sing-box://", "clash://", "clash-meta://",
+                                        "hiddify://", "v2ray://", "v2rayng://")
+                if not resolved.startswith(("http://", "https://")) and \
+                   resolved.startswith(_ALLOWED_APP_SCHEMES):
                     log.info("  ↳ app redirect %d → %s", e.code, resolved[:120])
                     raise _AppRedirect(e.code, resolved)
                 log.info("  ↳ following %d → %s", e.code, resolved[:120])
@@ -445,8 +452,8 @@ class SubProxyHandler(BaseHTTPRequestHandler):
 
         except _AppRedirect as r:
             # App deep link (sing-box://, clash://) — rewrite inner URL and pass 302 to client
-            host = self.headers.get("Host", srv.relay_address)
-            external_base = f"https://{host}"
+            # Use relay_address from config, NOT client-supplied Host (prevents open redirect)
+            external_base = f"https://{srv.relay_address}"
             rewritten = _rewrite_app_redirect(r.location, srv, external_base)
             log.info("[%s] App redirect %d → %s (rewritten)", srv.name, r.code,
                      rewritten[:120])
