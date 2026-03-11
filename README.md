@@ -52,7 +52,7 @@ nano .env
 # 3. Установить (systemd + копирование файлов)
 sudo bash setup.sh
 
-# 4. Добавить location-блоки в nginx конфиг
+# 4. Добавить location-блоки в nginx конфиг (включая catch-all location /)
 #    (setup.sh покажет что именно добавить)
 
 # 5. Перезагрузить nginx
