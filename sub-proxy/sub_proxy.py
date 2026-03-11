@@ -67,15 +67,22 @@ if not UPSTREAM_SSL_VERIFY:
 
 
 _ssl_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
+_opener = urllib.request.build_opener(_ssl_handler)
 
 
-def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5) -> urllib.request.addinfourl:
-    """Fetch URL, manually following redirects (up to max_redirects).
+class _AppRedirect(Exception):
+    """Upstream responded with a redirect to an app deep link (sing-box://, clash://, etc.)."""
+    def __init__(self, code: int, location: str):
+        self.code = code
+        self.location = location
 
-    urllib's default redirect handler chokes on query-only Location headers
-    like '?url=https://...' that 3x-ui uses.  We resolve them ourselves.
+
+def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
+    """Fetch URL, manually following HTTP(S) redirects.
+
+    App deep-link redirects (sing-box://, clash://) are raised as _AppRedirect
+    so the caller can rewrite and pass them through to the client.
     """
-    opener = urllib.request.build_opener(_ssl_handler)
     visited: set[str] = set()
 
     for _ in range(max_redirects + 1):
@@ -85,20 +92,54 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5) -> ur
 
         req = urllib.request.Request(url, headers=headers)
         try:
-            resp = opener.open(req, timeout=UPSTREAM_TIMEOUT)
-            return resp
+            return _opener.open(req, timeout=UPSTREAM_TIMEOUT)
         except urllib.error.HTTPError as e:
             if 300 <= e.code < 400:
                 location = e.headers.get("Location", "")
                 if not location:
                     raise
-                # Resolve relative Location against current URL
-                url = urllib.parse.urljoin(url, location)
-                log.info("  ↳ following %d → %s", e.code, url[:120])
+                resolved = urllib.parse.urljoin(url, location)
+                # App deep links (sing-box://, clash://) — don't follow, let caller handle
+                if not resolved.startswith(("http://", "https://")):
+                    log.info("  ↳ app redirect %d → %s", e.code, resolved[:120])
+                    raise _AppRedirect(e.code, resolved)
+                log.info("  ↳ following %d → %s", e.code, resolved[:120])
+                url = resolved
                 continue
             raise
 
     raise urllib.error.URLError(f"Too many redirects ({max_redirects})")
+
+
+def _rewrite_app_redirect(location: str, srv: ServerConfig, external_base: str) -> str:
+    """Rewrite upstream URL inside app deep link to point through relay.
+
+    Example input:
+      sing-box://import-remote-profile/?url=https://150.241.90.145/secret/base64...
+    Output:
+      sing-box://import-remote-profile/?url=https://relay:5443/xui-sub-de/base64...
+    """
+    parsed = urllib.parse.urlparse(location)
+    qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+    if "url" not in qs:
+        return location
+
+    inner_url = qs["url"][0]
+
+    # Replace upstream base URL with relay's external base + path prefix
+    upstream_base = srv.xui_sub_base_url.rstrip("/")
+    relay_base = external_base.rstrip("/") + srv.path_prefix.rstrip("/")
+    if inner_url.startswith(upstream_base):
+        inner_url = relay_base + inner_url[len(upstream_base):]
+
+    qs["url"] = [inner_url]
+    new_query = urllib.parse.urlencode(qs, doseq=True)
+    new_location = urllib.parse.urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, new_query, parsed.fragment,
+    ))
+    return new_location
 
 
 # ── Конфигурация сервера ───────────────────────────────────────────────────
@@ -402,6 +443,18 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(502, "Bad Gateway")
                 return
 
+        except _AppRedirect as r:
+            # App deep link (sing-box://, clash://) — rewrite inner URL and pass 302 to client
+            host = self.headers.get("Host", srv.relay_address)
+            external_base = f"https://{host}"
+            rewritten = _rewrite_app_redirect(r.location, srv, external_base)
+            log.info("[%s] App redirect %d → %s (rewritten)", srv.name, r.code,
+                     rewritten[:120])
+            self.send_response(r.code)
+            self.send_header("Location", rewritten)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         except urllib.error.HTTPError as e:
             log.error("[%s] Upstream HTTP %d for %s", srv.name, e.code, _mask_token(safe_path))
             self.send_error(e.code if e.code in (400, 404) else 502, "Error")
