@@ -66,10 +66,39 @@ if not UPSTREAM_SSL_VERIFY:
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
-# Opener, который следует редиректам (по умолчанию до 10) с нашим SSL-контекстом.
-# Upstream 3x-ui может отвечать 302 с ?url=... — проще следовать внутри прокси,
-# чем переписывать Location и пробрасывать клиенту.
-_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_ctx))
+_ssl_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
+
+
+def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5) -> urllib.request.addinfourl:
+    """Fetch URL, manually following redirects (up to max_redirects).
+
+    urllib's default redirect handler chokes on query-only Location headers
+    like '?url=https://...' that 3x-ui uses.  We resolve them ourselves.
+    """
+    opener = urllib.request.build_opener(_ssl_handler)
+    visited: set[str] = set()
+
+    for _ in range(max_redirects + 1):
+        if url in visited:
+            raise urllib.error.URLError("Redirect loop detected")
+        visited.add(url)
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            resp = opener.open(req, timeout=UPSTREAM_TIMEOUT)
+            return resp
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                location = e.headers.get("Location", "")
+                if not location:
+                    raise
+                # Resolve relative Location against current URL
+                url = urllib.parse.urljoin(url, location)
+                log.info("  ↳ following %d → %s", e.code, url[:120])
+                continue
+            raise
+
+    raise urllib.error.URLError(f"Too many redirects ({max_redirects})")
 
 
 # ── Конфигурация сервера ───────────────────────────────────────────────────
@@ -353,13 +382,10 @@ class SubProxyHandler(BaseHTTPRequestHandler):
         log.info("[%s] → %s (from %s)", srv.name, _mask_token(safe_path), self.address_string())
 
         try:
-            req = urllib.request.Request(
+            resp = _fetch_with_redirects(
                 upstream_url,
                 headers={"User-Agent": self.headers.get("User-Agent", "SubProxy/1.0")},
             )
-            # _opener следует редиректам внутри прокси (upstream 3x-ui
-            # часто отвечает 302 ?url=... — клиенту это не нужно видеть).
-            resp = _opener.open(req, timeout=UPSTREAM_TIMEOUT)
 
             status = resp.status
             ct = resp.headers.get("Content-Type", "")
