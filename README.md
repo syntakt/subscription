@@ -35,7 +35,7 @@
 | Сервер | Prefix | Формат подписки | Ссылка подписки |
 |--------|--------|-----------------|-----------------|
 | NL | `/xui-sub/` | токен в пути | `https://relay:5443/xui-sub/<token>` |
-| DE | `/xui-sub-de/` | токен в query | `https://relay:5443/xui-sub-de/?id=<UUID>` |
+| DE | `/xui-sub-de/` | параметры в query | `https://relay:5443/xui-sub-de/?t=si&s=<UUID>` |
 
 Роутинг выполняет `sub_proxy.py` — один процесс обрабатывает все серверы.
 
@@ -124,7 +124,7 @@ sudo systemctl restart sub-proxy
 curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | base64 -d
 
 # Тест (DE, query формат)
-curl -sk "https://127.0.0.1:5443/xui-sub-de/?id=<UUID>" | base64 -d
+curl -sk "https://127.0.0.1:5443/xui-sub-de/?t=si&r=si&s=<UUID>" | base64 -d
 ```
 
 ## Добавление нового сервера
