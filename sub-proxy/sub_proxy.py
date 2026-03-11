@@ -111,7 +111,7 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
     raise urllib.error.URLError(f"Too many redirects ({max_redirects})")
 
 
-def _rewrite_app_redirect(location: str, srv: ServerConfig, external_base: str) -> str:
+def _rewrite_app_redirect(location: str, srv: "ServerConfig", external_base: str) -> str:
     """Rewrite upstream URL inside app deep link to point through relay.
 
     Example input:
