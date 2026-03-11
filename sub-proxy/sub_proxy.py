@@ -66,34 +66,10 @@ if not UPSTREAM_SSL_VERIFY:
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
-class _NoRedirectHandler(urllib.request.HTTPSHandler):
-    """HTTPS handler that does NOT follow redirects (returns 3xx as-is)."""
-    def __init__(self):
-        super().__init__(context=ssl_ctx)
-
-    def https_redirect(self, req, fp, code, msg, headers):
-        return fp
-
-    https_error_301 = https_redirect
-    https_error_302 = https_redirect
-    https_error_303 = https_redirect
-    https_error_307 = https_redirect
-    https_error_308 = https_redirect
-
-
-class _NoRedirectHTTPHandler(urllib.request.HTTPHandler):
-    """HTTP handler that does NOT follow redirects."""
-    def http_redirect(self, req, fp, code, msg, headers):
-        return fp
-
-    http_error_301 = http_redirect
-    http_error_302 = http_redirect
-    http_error_303 = http_redirect
-    http_error_307 = http_redirect
-    http_error_308 = http_redirect
-
-
-_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler, _NoRedirectHTTPHandler)
+# Opener, который следует редиректам (по умолчанию до 10) с нашим SSL-контекстом.
+# Upstream 3x-ui может отвечать 302 с ?url=... — проще следовать внутри прокси,
+# чем переписывать Location и пробрасывать клиенту.
+_opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_ctx))
 
 
 # ── Конфигурация сервера ───────────────────────────────────────────────────
@@ -332,39 +308,6 @@ def _mask_token(path: str) -> str:
     return masked + "?..." if "?" in path else masked
 
 
-def _rewrite_redirect(location: str, srv: ServerConfig) -> str:
-    """Переписать Location-заголовок редиректа от upstream.
-
-    Upstream (3x-ui) может вернуть:
-      Location: https://upstream-host/paccab1d072/base64...
-      Location: /paccab1d072/base64...
-    Нужно переписать в:
-      Location: /xui-sub-de/paccab1d072/base64...  (относительный)
-    Чтобы браузер остался в пределах нашего path prefix → nginx → sub_proxy.
-    """
-    parsed = urllib.parse.urlparse(location)
-
-    # Извлекаем path из Location (абсолютный или относительный)
-    redirect_path = parsed.path or "/"
-
-    # Убираем base_path upstream-а из начала (если есть)
-    # Например, upstream base_url = https://host/secret_path
-    # Редирект может быть: /secret_path/hash/base64 → нужен /hash/base64
-    upstream_base_path = urllib.parse.urlparse(srv.xui_sub_base_url).path.rstrip("/")
-    if upstream_base_path and redirect_path.startswith(upstream_base_path):
-        redirect_path = redirect_path[len(upstream_base_path):]
-
-    # Если путь уже начинается с нашего prefix — не дублируем
-    prefix = srv.path_prefix.rstrip("/")
-    if not redirect_path.startswith(prefix):
-        redirect_path = prefix + redirect_path
-
-    # Собираем query string если есть
-    if parsed.query:
-        return f"{redirect_path}?{parsed.query}"
-    return redirect_path
-
-
 # Собираем список разрешённых префиксов из всех серверов
 ALLOWED_PREFIXES = [srv.path_prefix for srv in SERVERS]
 
@@ -414,29 +357,12 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                 upstream_url,
                 headers={"User-Agent": self.headers.get("User-Agent", "SubProxy/1.0")},
             )
-            resp = _no_redirect_opener.open(req, timeout=UPSTREAM_TIMEOUT)
+            # _opener следует редиректам внутри прокси (upstream 3x-ui
+            # часто отвечает 302 ?url=... — клиенту это не нужно видеть).
+            resp = _opener.open(req, timeout=UPSTREAM_TIMEOUT)
 
             status = resp.status
             ct = resp.headers.get("Content-Type", "")
-
-            # ── Перехват 3xx редиректов ──
-            # Upstream 3x-ui может отвечать 302 на /hash/base64... путь.
-            # Переписываем Location, чтобы редирект оставался в пределах
-            # нашего path prefix (nginx location продолжит роутить на sub_proxy).
-            if 300 <= status < 400:
-                location = resp.headers.get("Location", "")
-                if location:
-                    rewritten = _rewrite_redirect(location, srv)
-                    log.info("[%s] Redirect %d → %s (rewritten)", srv.name, status,
-                             _mask_token(rewritten[:200]))
-                    self.send_response(status)
-                    self.send_header("Location", rewritten)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                # 3xx без Location — пропускаем как есть
-                self.send_error(502, "Bad Gateway")
-                return
 
             content_length = resp.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_RESPONSE_SIZE:
@@ -451,22 +377,6 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                 return
 
         except urllib.error.HTTPError as e:
-            # 3xx redirect caught as HTTPError (urllib quirk with custom openers)
-            if 300 <= e.code < 400:
-                location = e.headers.get("Location", "")
-                if location:
-                    rewritten = _rewrite_redirect(location, srv)
-                    log.info("[%s] Redirect %d → %s (rewritten, from HTTPError)",
-                             srv.name, e.code, _mask_token(rewritten[:200]))
-                    self.send_response(e.code)
-                    self.send_header("Location", rewritten)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                log.error("[%s] Redirect %d without Location for %s",
-                          srv.name, e.code, _mask_token(safe_path))
-                self.send_error(502, "Bad Gateway")
-                return
             log.error("[%s] Upstream HTTP %d for %s", srv.name, e.code, _mask_token(safe_path))
             self.send_error(e.code if e.code in (400, 404) else 502, "Error")
             return
