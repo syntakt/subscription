@@ -6,9 +6,9 @@
 #
 # Что делает:
 #   1. Копирует sub_proxy.py и .env в /opt/sub-proxy/
-#   2. Устанавливает systemd unit
-#   3. Запускает сервис
-#   4. Показывает пример nginx location для добавления в конфиг
+#   2. Копирует nginx конфиги в /etc/nginx/conf.d/
+#   3. Устанавливает systemd unit
+#   4. Запускает сервис и перезагружает nginx
 #
 # Поддерживает два формата конфигурации:
 #   - Legacy (одиночный сервер): XUI_SUB_BASE_URL, RELAY_ADDRESS, ...
@@ -23,6 +23,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/sub-proxy"
+
+# ── Проверка root ──────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Скрипт должен быть запущен от root (sudo bash setup.sh)"
+    exit 1
+fi
 
 # ── Проверка .env ────────────────────────────────────────────────────────────
 if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
@@ -52,6 +58,7 @@ if [[ -n "${SERVERS:-}" ]]; then
         relay_var="${prefix}RELAY_ADDRESS"
         addrs_var="${prefix}XUI_ADDRESSES"
         path_var="${prefix}PATH_PREFIX"
+        port_map_var="${prefix}PORT_MAP"
 
         for var in "$url_var" "$relay_var" "$addrs_var"; do
             if [[ -z "${!var:-}" ]]; then
@@ -64,7 +71,7 @@ if [[ -n "${SERVERS:-}" ]]; then
         echo "    Upstream:    ${!url_var}"
         echo "    Relay addr:  ${!relay_var}"
         echo "    XUI addrs:   ${!addrs_var}"
-        echo "    Port map:    ${!prefix+"${prefix}PORT_MAP":-none}"
+        echo "    Port map:    ${!port_map_var:-none}"
         echo "    Path prefix: ${!path_var:-/xui-sub-${name,,}/}"
     done
 else
@@ -86,8 +93,8 @@ fi
 echo "  Listen:      ${SUB_PROXY_HOST:-127.0.0.1}:${SUB_PROXY_PORT:-9080}"
 echo ""
 
-# ── Установка файлов ─────────────────────────────────────────────────────────
-echo "[1/3] Копирую файлы в ${INSTALL_DIR}..."
+# ── Установка файлов sub-proxy ────────────────────────────────────────────────
+echo "[1/4] Копирую файлы sub-proxy в ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 cp "${SCRIPT_DIR}/sub-proxy/sub_proxy.py" "${INSTALL_DIR}/sub_proxy.py"
 cp "${SCRIPT_DIR}/.env" "${INSTALL_DIR}/.env"
@@ -96,8 +103,25 @@ chmod 644 "${INSTALL_DIR}/sub_proxy.py"
 echo "  → ${INSTALL_DIR}/sub_proxy.py"
 echo "  → ${INSTALL_DIR}/.env"
 
+# ── Установка nginx конфигов ──────────────────────────────────────────────────
+echo "[2/4] Копирую nginx конфиги..."
+cp "${SCRIPT_DIR}/nginx/conf.d/vpn-proxy.conf" /etc/nginx/conf.d/vpn-proxy.conf
+cp "${SCRIPT_DIR}/nginx/conf.d/sub-proxy-common.inc" /etc/nginx/conf.d/sub-proxy-common.inc
+chmod 644 /etc/nginx/conf.d/vpn-proxy.conf
+chmod 644 /etc/nginx/conf.d/sub-proxy-common.inc
+echo "  → /etc/nginx/conf.d/vpn-proxy.conf"
+echo "  → /etc/nginx/conf.d/sub-proxy-common.inc"
+
+# Проверка nginx конфигурации перед применением
+echo "  Проверяю nginx конфигурацию..."
+if ! nginx -t 2>&1; then
+    echo "ERROR: nginx -t не прошёл! Проверьте конфиги."
+    exit 1
+fi
+echo "  ✓ nginx -t OK"
+
 # ── Установка systemd unit ───────────────────────────────────────────────────
-echo "[2/3] Устанавливаю systemd сервис..."
+echo "[3/4] Устанавливаю systemd сервис..."
 cp "${SCRIPT_DIR}/sub-proxy/sub-proxy.service" /etc/systemd/system/sub-proxy.service
 systemctl daemon-reload
 systemctl enable sub-proxy
@@ -105,7 +129,7 @@ systemctl restart sub-proxy
 echo "  → systemctl status sub-proxy"
 
 # ── Проверка ─────────────────────────────────────────────────────────────────
-echo "[3/3] Проверяю..."
+echo "[4/4] Проверяю..."
 sleep 1
 if systemctl is-active --quiet sub-proxy; then
     echo "  ✓ sub-proxy запущен"
@@ -115,16 +139,12 @@ else
     exit 1
 fi
 
+# Перезагрузка nginx
+systemctl reload nginx
+echo "  ✓ nginx перезагружен"
+
 echo ""
 echo "=== Готово! ==="
-echo ""
-echo "Добавьте в nginx конфиг (server { listen 5443 ssl; ... }):"
-echo "─────────────────────────────────────────────────────────"
-cat "${SCRIPT_DIR}/nginx/conf.d/subscription-relay.conf"
-echo "─────────────────────────────────────────────────────────"
-echo ""
-echo "После добавления:"
-echo "  nginx -t && systemctl reload nginx"
 echo ""
 
 if [[ -n "${SERVERS:-}" ]]; then
