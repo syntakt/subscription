@@ -6,9 +6,13 @@
 #
 # Что делает:
 #   1. Копирует sub_proxy.py и .env в /opt/sub-proxy/
-#   2. Копирует nginx конфиги в /etc/nginx/conf.d/
-#   3. Устанавливает systemd unit
-#   4. Запускает сервис и перезагружает nginx
+#   2. Устанавливает systemd unit
+#   3. Запускает сервис
+#
+# nginx конфиги устанавливаются вручную:
+#   cp nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/
+#   cp nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/
+#   nginx -t && systemctl reload nginx
 #
 # Поддерживает два формата конфигурации:
 #   - Legacy (одиночный сервер): XUI_SUB_BASE_URL, RELAY_ADDRESS, ...
@@ -94,7 +98,7 @@ echo "  Listen:      ${SUB_PROXY_HOST:-127.0.0.1}:${SUB_PROXY_PORT:-9080}"
 echo ""
 
 # ── Установка файлов sub-proxy ────────────────────────────────────────────────
-echo "[1/4] Копирую файлы sub-proxy в ${INSTALL_DIR}..."
+echo "[1/3] Копирую файлы sub-proxy в ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 cp "${SCRIPT_DIR}/sub-proxy/sub_proxy.py" "${INSTALL_DIR}/sub_proxy.py"
 cp "${SCRIPT_DIR}/.env" "${INSTALL_DIR}/.env"
@@ -103,25 +107,8 @@ chmod 644 "${INSTALL_DIR}/sub_proxy.py"
 echo "  → ${INSTALL_DIR}/sub_proxy.py"
 echo "  → ${INSTALL_DIR}/.env"
 
-# ── Установка nginx конфигов ──────────────────────────────────────────────────
-echo "[2/4] Копирую nginx конфиги..."
-cp "${SCRIPT_DIR}/nginx/conf.d/vpn-proxy.conf" /etc/nginx/conf.d/vpn-proxy.conf
-cp "${SCRIPT_DIR}/nginx/conf.d/sub-proxy-common.inc" /etc/nginx/conf.d/sub-proxy-common.inc
-chmod 644 /etc/nginx/conf.d/vpn-proxy.conf
-chmod 644 /etc/nginx/conf.d/sub-proxy-common.inc
-echo "  → /etc/nginx/conf.d/vpn-proxy.conf"
-echo "  → /etc/nginx/conf.d/sub-proxy-common.inc"
-
-# Проверка nginx конфигурации перед применением
-echo "  Проверяю nginx конфигурацию..."
-if ! nginx -t 2>&1; then
-    echo "ERROR: nginx -t не прошёл! Проверьте конфиги."
-    exit 1
-fi
-echo "  ✓ nginx -t OK"
-
 # ── Установка systemd unit ───────────────────────────────────────────────────
-echo "[3/4] Устанавливаю systemd сервис..."
+echo "[2/3] Устанавливаю systemd сервис..."
 cp "${SCRIPT_DIR}/sub-proxy/sub-proxy.service" /etc/systemd/system/sub-proxy.service
 systemctl daemon-reload
 systemctl enable sub-proxy
@@ -129,7 +116,7 @@ systemctl restart sub-proxy
 echo "  → systemctl status sub-proxy"
 
 # ── Проверка ─────────────────────────────────────────────────────────────────
-echo "[4/4] Проверяю..."
+echo "[3/3] Проверяю..."
 sleep 1
 if systemctl is-active --quiet sub-proxy; then
     echo "  ✓ sub-proxy запущен"
@@ -139,12 +126,13 @@ else
     exit 1
 fi
 
-# Перезагрузка nginx
-systemctl reload nginx
-echo "  ✓ nginx перезагружен"
-
 echo ""
 echo "=== Готово! ==="
+echo ""
+echo "Не забудьте установить nginx конфиги вручную:"
+echo "  cp ${SCRIPT_DIR}/nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/"
+echo "  cp ${SCRIPT_DIR}/nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/"
+echo "  nginx -t && systemctl reload nginx"
 echo ""
 
 if [[ -n "${SERVERS:-}" ]]; then
