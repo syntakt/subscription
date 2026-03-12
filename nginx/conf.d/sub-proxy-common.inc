@@ -4,13 +4,12 @@
 # Подключается через include в каждом location /xui-sub*/ блоке.
 # Позволяет добавлять новые серверы без дублирования конфигурации.
 #
+# Файл с расширением .inc (не .conf!) — чтобы nginx НЕ подгружал его
+# автоматически через "include /etc/nginx/conf.d/*.conf" на уровне http{}.
+#
 # ВАЖНО: limit_except должен быть в самом location-блоке (nginx не позволяет
 # использовать его внутри include), поэтому добавляйте его вручную:
 #   limit_except GET HEAD { deny all; }
-#
-# Директивы proxy_hide_header, proxy_intercept_errors, error_page,
-# proxy_set_header X-Real-IP/X-Forwarded-*, proxy_connect_timeout
-# наследуются из server-блока (vpn-proxy.conf) — здесь НЕ дублируем.
 # =============================================================================
 
 limit_req zone=one burst=5 nodelay;
@@ -30,6 +29,16 @@ proxy_buffering        on;
 proxy_buffer_size      16k;
 proxy_buffers          4 32k;
 proxy_busy_buffers_size 32k;
+
+# ── Перехват ошибок backend для подписок ──
+# Server-уровневый error_page покрывает только 500-504.
+# Для подписок перехватываем также 400/401/403/404 — чтобы verbose ответы
+# от Python backend (BaseHTTPRequestHandler.send_error генерирует HTML)
+# не утекали к клиенту.
+proxy_intercept_errors on;
+error_page 400 401 403 =404 @sub_err_not_found;
+error_page 404          =404 @sub_err_not_found;
+error_page 500 502 503 504 =502 @sub_err_bad_gw;
 
 # ── Заголовки безопасности (специфичны для подписок) ──
 # При наличии add_header в location — глобальные из server{} НЕ наследуются,
