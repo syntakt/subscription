@@ -40,14 +40,16 @@ from dataclasses import dataclass, field
 LISTEN_HOST = os.environ.get("SUB_PROXY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SUB_PROXY_PORT", "9080"))
 
-# Таймаут запроса к 3x-ui (секунды)
-UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "10"))
+# Таймаут запроса к 3x-ui (секунды, макс 60)
+UPSTREAM_TIMEOUT = min(int(os.environ.get("UPSTREAM_TIMEOUT", "10")), 60)
 
-# Максимальный размер ответа от upstream (байты, защита от OOM)
-MAX_RESPONSE_SIZE = int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024)))  # 5 MB
+# Максимальный размер ответа от upstream (байты, защита от OOM, макс 50 MB)
+MAX_RESPONSE_SIZE = min(int(os.environ.get("MAX_RESPONSE_SIZE", str(5 * 1024 * 1024))),
+                        50 * 1024 * 1024)
 
 # Проверка SSL-сертификата upstream (3x-ui)
-UPSTREAM_SSL_VERIFY = os.environ.get("UPSTREAM_SSL_VERIFY", "false").lower() in ("true", "1", "yes")
+# По умолчанию включена — отключайте ТОЛЬКО для самоподписанных сертификатов
+UPSTREAM_SSL_VERIFY = os.environ.get("UPSTREAM_SSL_VERIFY", "true").lower() in ("true", "1", "yes")
 
 # ── Логирование ─────────────────────────────────────────────────────────────
 
@@ -62,6 +64,7 @@ log = logging.getLogger("sub-proxy")
 
 ssl_ctx = ssl.create_default_context()
 if not UPSTREAM_SSL_VERIFY:
+    log.warning("⚠ UPSTREAM_SSL_VERIFY=false — upstream certificate NOT verified (MITM risk)")
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
@@ -99,8 +102,12 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
                 if not location:
                     raise
                 resolved = urllib.parse.urljoin(url, location)
-                # App deep links (sing-box://, clash://) — don't follow, let caller handle
-                if not resolved.startswith(("http://", "https://")):
+                # App deep links — don't follow, let caller handle
+                # Only allow known VPN app schemes (block javascript:, data:, file:, etc.)
+                _ALLOWED_APP_SCHEMES = ("sing-box://", "clash://", "clash-meta://",
+                                        "hiddify://", "v2ray://", "v2rayng://")
+                if not resolved.startswith(("http://", "https://")) and \
+                   resolved.startswith(_ALLOWED_APP_SCHEMES):
                     log.info("  ↳ app redirect %d → %s", e.code, resolved[:120])
                     raise _AppRedirect(e.code, resolved)
                 log.info("  ↳ following %d → %s", e.code, resolved[:120])
@@ -153,6 +160,14 @@ class ServerConfig:
     xui_addresses: list[str]
     port_map: dict[str, str] = field(default_factory=dict)
     path_prefix: str = "/xui-sub/"
+    relay_port: str = ""
+
+    @property
+    def external_base_url(self) -> str:
+        """Внешний URL relay-сервера (с портом, если задан)."""
+        if self.relay_port and self.relay_port != "443":
+            return f"https://{self.relay_address}:{self.relay_port}"
+        return f"https://{self.relay_address}"
 
 
 def _parse_port_map(raw: str) -> dict[str, str]:
@@ -178,6 +193,7 @@ def _load_servers() -> list[ServerConfig]:
             xui_addresses=[a.strip() for a in os.environ["XUI_ADDRESSES"].split(",") if a.strip()],
             port_map=_parse_port_map(os.environ.get("PORT_MAP", "")),
             path_prefix=os.environ.get("ALLOWED_PATH_PREFIX", "/xui-sub/"),
+            relay_port=os.environ.get("RELAY_PORT", ""),
         )]
 
     # Мульти-сервер формат
@@ -198,6 +214,7 @@ def _load_servers() -> list[ServerConfig]:
             ],
             port_map=_parse_port_map(os.environ.get(f"{prefix}PORT_MAP", "")),
             path_prefix=os.environ.get(f"{prefix}PATH_PREFIX", f"/xui-sub-{name.lower()}/"),
+            relay_port=os.environ.get(f"{prefix}RELAY_PORT", os.environ.get("RELAY_PORT", "")),
         ))
     return servers
 
@@ -276,15 +293,38 @@ def _replace_vmess(uri: str, srv: ServerConfig) -> str:
         return uri
 
 
+def _replace_in_outbound(outbound: dict, srv: ServerConfig) -> None:
+    """Замена адреса и порта в одном outbound sing-box конфига.
+
+    Заменяет ТОЛЬКО:
+      - "server" — адрес сервера для подключения
+      - "server_port" — порт сервера
+
+    НЕ трогает (relay пробрасывает TCP «как есть», TLS/REALITY end-to-end):
+      - "server_name" (SNI для TLS/REALITY)
+      - routing rules: domain, domain_suffix, ip_cidr, и пр.
+    """
+    server = outbound.get("server", "")
+    if server in srv.xui_addresses:
+        outbound["server"] = srv.relay_address
+
+    port_str = str(outbound.get("server_port", ""))
+    if port_str in srv.port_map:
+        try:
+            outbound["server_port"] = int(srv.port_map[port_str])
+        except ValueError:
+            outbound["server_port"] = srv.port_map[port_str]
+
+
 def replace_in_json(data: dict, srv: ServerConfig) -> dict:
-    """Рекурсивная замена адресов в JSON-подписке (sing-box формат)."""
-    text = json.dumps(data, ensure_ascii=False)
-    for xui_addr in srv.xui_addresses:
-        text = text.replace(xui_addr, srv.relay_address)
-    for src_port, dst_port in srv.port_map.items():
-        text = text.replace(f'"server_port":{src_port}', f'"server_port":{dst_port}')
-        text = text.replace(f'"server_port": {src_port}', f'"server_port": {dst_port}')
-    return json.loads(text)
+    """Точечная замена адресов в JSON-подписке (sing-box формат).
+
+    Заменяет адрес/порт только в outbound'ах (поле "server"/"server_port").
+    Не трогает server_name (SNI), routing rules (domain, domain_suffix, ip_cidr и т.д.).
+    """
+    for outbound in data.get("outbounds", []):
+        _replace_in_outbound(outbound, srv)
+    return data
 
 
 def transform_subscription(raw_body: bytes, content_type: str, srv: ServerConfig) -> bytes:
@@ -445,8 +485,8 @@ class SubProxyHandler(BaseHTTPRequestHandler):
 
         except _AppRedirect as r:
             # App deep link (sing-box://, clash://) — rewrite inner URL and pass 302 to client
-            host = self.headers.get("Host", srv.relay_address)
-            external_base = f"https://{host}"
+            # Use relay_address from config, NOT client-supplied Host (prevents open redirect)
+            external_base = srv.external_base_url
             rewritten = _rewrite_app_redirect(r.location, srv, external_base)
             log.info("[%s] App redirect %d → %s (rewritten)", srv.name, r.code,
                      rewritten[:120])
@@ -501,6 +541,7 @@ def main():
         log.info("  ── [%s] ──", srv.name)
         log.info("    Upstream:   %s", srv.xui_sub_base_url)
         log.info("    Relay addr: %s", srv.relay_address)
+        log.info("    Relay port: %s", srv.relay_port or "(default 443)")
         log.info("    Port map:   %s", srv.port_map or "(none)")
         log.info("    XUI addrs:  %s", srv.xui_addresses)
         log.info("    Path prefix: %s", srv.path_prefix)
