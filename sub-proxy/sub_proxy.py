@@ -73,6 +73,25 @@ _ssl_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
 _opener = urllib.request.build_opener(_ssl_handler)
 
 
+# ── Настройка ключей замены для sing-box JSON ────────────────────────────────
+# Белый список JSON-ключей, в которых заменяются адреса и порты.
+# Всё, что НЕ в этом списке, остаётся без изменений (server_name, domain,
+# domain_suffix, ip_cidr и т.д.).
+SINGBOX_ADDR_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("SINGBOX_ADDR_KEYS", "server").split(",") if k.strip()
+)
+SINGBOX_PORT_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("SINGBOX_PORT_KEYS", "server_port").split(",") if k.strip()
+)
+
+# Максимальная глубина рекурсии при обходе JSON (защита от патологических конфигов)
+_MAX_JSON_DEPTH = 32
+
+# Разрешённые схемы app deep link (block javascript:, data:, file:, etc.)
+_ALLOWED_APP_SCHEMES = ("sing-box://", "clash://", "clash-meta://",
+                        "hiddify://", "v2ray://", "v2rayng://")
+
+
 class _AppRedirect(Exception):
     """Upstream responded with a redirect to an app deep link (sing-box://, clash://, etc.)."""
     def __init__(self, code: int, location: str):
@@ -103,9 +122,6 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
                     raise
                 resolved = urllib.parse.urljoin(url, location)
                 # App deep links — don't follow, let caller handle
-                # Only allow known VPN app schemes (block javascript:, data:, file:, etc.)
-                _ALLOWED_APP_SCHEMES = ("sing-box://", "clash://", "clash-meta://",
-                                        "hiddify://", "v2ray://", "v2rayng://")
                 if not resolved.startswith(("http://", "https://")) and \
                    resolved.startswith(_ALLOWED_APP_SCHEMES):
                     log.info("  ↳ app redirect %d → %s", e.code, resolved[:120])
@@ -293,37 +309,52 @@ def _replace_vmess(uri: str, srv: ServerConfig) -> str:
         return uri
 
 
-def _replace_in_outbound(outbound: dict, srv: ServerConfig) -> None:
-    """Замена адреса и порта в одном outbound sing-box конфига.
+def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
+    """Рекурсивный обход JSON — замена адресов/портов ТОЛЬКО в ключах из белого списка.
 
-    Заменяет ТОЛЬКО:
-      - "server" — адрес сервера для подключения
-      - "server_port" — порт сервера
+    Обходит весь JSON-документ, но заменяет значения только если имя ключа
+    входит в SINGBOX_ADDR_KEYS (замена адреса) или SINGBOX_PORT_KEYS (замена порта).
 
-    НЕ трогает (relay пробрасывает TCP «как есть», TLS/REALITY end-to-end):
-      - "server_name" (SNI для TLS/REALITY)
-      - routing rules: domain, domain_suffix, ip_cidr, и пр.
+    Всё остальное (server_name, domain, domain_suffix, ip_cidr, и т.д.)
+    остаётся без изменений — relay пробрасывает TCP «как есть»,
+    TLS/REALITY работает end-to-end.
     """
-    server = outbound.get("server", "")
-    if server in srv.xui_addresses:
-        outbound["server"] = srv.relay_address
+    if depth > _MAX_JSON_DEPTH:
+        return
 
-    port_str = str(outbound.get("server_port", ""))
-    if port_str in srv.port_map:
-        try:
-            outbound["server_port"] = int(srv.port_map[port_str])
-        except ValueError:
-            outbound["server_port"] = srv.port_map[port_str]
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            # Замена адреса
+            if key in SINGBOX_ADDR_KEYS and isinstance(value, str):
+                if value in srv.xui_addresses:
+                    obj[key] = srv.relay_address
+            # Замена порта
+            elif key in SINGBOX_PORT_KEYS and isinstance(value, (int, str)):
+                port_str = str(value)
+                if port_str in srv.port_map:
+                    try:
+                        obj[key] = int(srv.port_map[port_str])
+                    except ValueError:
+                        obj[key] = srv.port_map[port_str]
+            # Рекурсия в вложенные объекты/массивы
+            elif isinstance(value, (dict, list)):
+                _walk_and_replace(value, srv, depth + 1)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _walk_and_replace(item, srv, depth + 1)
 
 
 def replace_in_json(data: dict, srv: ServerConfig) -> dict:
     """Точечная замена адресов в JSON-подписке (sing-box формат).
 
-    Заменяет адрес/порт только в outbound'ах (поле "server"/"server_port").
+    Заменяет адрес/порт только в ключах из белого списка (SINGBOX_ADDR_KEYS/PORT_KEYS).
+    По умолчанию: server, server_port.
     Не трогает server_name (SNI), routing rules (domain, domain_suffix, ip_cidr и т.д.).
+    Настраивается через .env: SINGBOX_ADDR_KEYS, SINGBOX_PORT_KEYS.
     """
-    for outbound in data.get("outbounds", []):
-        _replace_in_outbound(outbound, srv)
+    _walk_and_replace(data, srv)
     return data
 
 
@@ -472,7 +503,7 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             ct = resp.headers.get("Content-Type", "")
 
             content_length = resp.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_RESPONSE_SIZE:
+            if content_length and content_length.isdigit() and int(content_length) > MAX_RESPONSE_SIZE:
                 log.error("Upstream response too large: %s bytes", content_length)
                 self.send_error(502, "Bad Gateway")
                 return
@@ -536,6 +567,8 @@ def main():
     log.info("Subscription Relay Proxy")
     log.info("  Listen: %s:%d", LISTEN_HOST, LISTEN_PORT)
     log.info("  SSL verify: %s", UPSTREAM_SSL_VERIFY)
+    log.info("  Sing-box addr keys: %s", SINGBOX_ADDR_KEYS)
+    log.info("  Sing-box port keys: %s", SINGBOX_PORT_KEYS)
     log.info("  Servers: %d", len(SERVERS))
     for srv in SERVERS:
         log.info("  ── [%s] ──", srv.name)
