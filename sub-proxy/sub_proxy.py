@@ -337,8 +337,7 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
     Порядок для ключа, входящего в несколько списков (например «server»):
       1. Если значение совпадает с xui_address → relay_address (приоритет)
-      2. Иначе, если содержит ~domain~ → DOMAIN_REPLACE
-         → если результат совпал с xui_address — цепочка до relay_address
+      2. Иначе, если содержит ~domain~ → DOMAIN_REPLACE (конечное значение)
 
     Всё остальное (server_name, domain, domain_suffix, ip_cidr, predefined и т.д.)
     остаётся без изменений.
@@ -365,16 +364,14 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
                     continue
 
             # ── 3. Замена ~domain~ (белый список SINGBOX_DOMAIN_KEYS) ──
+            #  Плейсхолдер ~domain~ заменяется на DOMAIN_REPLACE как есть.
+            #  Цепочка до relay_address НЕ выполняется — DOMAIN_REPLACE
+            #  всегда остаётся конечным значением (для DNS, hosts и т.д.).
+            #  Outbound server обрабатывается шагом 1 (ADDR_KEYS), т.к. 3x-ui
+            #  заменяет ~domain~ на реальный адрес до передачи в proxy.
             if key in SINGBOX_DOMAIN_KEYS and isinstance(value, str):
                 if srv.domain_replace and "~domain~" in value:
-                    new_val = value.replace("~domain~", srv.domain_replace)
-                    # Если ключ также в ADDR_KEYS и новое значение — xui-адрес,
-                    # продолжаем цепочку: ~domain~ → domain → relay_address
-                    # (outbound server, где 3x-ui не заменил ~domain~)
-                    if key in SINGBOX_ADDR_KEYS and new_val in srv.xui_addresses:
-                        obj[key] = srv.relay_address
-                    else:
-                        obj[key] = new_val
+                    obj[key] = value.replace("~domain~", srv.domain_replace)
                     continue
 
             # ── 4. Замена ~dnspath~ (белый список SINGBOX_DNS_PATH_KEYS) ──

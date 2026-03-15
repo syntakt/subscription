@@ -149,8 +149,8 @@ sudo nginx -t && sudo systemctl reload nginx
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Шаг 3. SINGBOX_DOMAIN_KEYS (по умолчанию: server)                     │
 │  Если значение содержит ~domain~ → заменяется на DOMAIN_REPLACE        │
+│  DOMAIN_REPLACE — всегда конечное значение (без цепочки до relay)       │
 │  Пример: "server": "~domain~" → "server": "xui.example.com"           │
-│  ⚠ Цепочка: если результат совпал с XUI_ADDRESS → RELAY_ADDRESS        │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Шаг 4. SINGBOX_DNS_PATH_KEYS (по умолчанию: path)                     │
 │  Если значение содержит ~dnspath~ → заменяется на DNS_PATH_REPLACE     │
@@ -221,41 +221,40 @@ sudo nginx -t && sudo systemctl reload nginx
 | Место | До | После | Почему |
 |-------|-----|-------|--------|
 | `dns.servers[0].predefined` | `{"~domain~": "~ip~"}` | `{"~domain~": "~ip~"}` | Ключ объекта — не трогается |
-| `dns.servers[1].server` | `"~domain~"` | `"xui.example.com"` | DOMAIN_KEYS, `~domain~` → `domain_replace`. Результат в xui_addresses, но это DNS — цепочка до relay? **Да**, см. замечание ниже |
+| `dns.servers[1].server` | `"~domain~"` | `"xui.example.com"` | DOMAIN_KEYS: `~domain~` → `domain_replace` (конечное значение) |
 | `dns.servers[1].path` | `"~dnspath~"` | `"/dns-query"` | DNS_PATH_KEYS |
 | `outbounds[0].server` | `"xui.example.com"` | `"relay.sslip.io"` | ADDR_KEYS (3x-ui уже заменил `~domain~`) |
 | `outbounds[0].server_port` | `443` | `8443` | PORT_KEYS |
 | `outbounds[0].tls.server_name` | `"~server_name~"` | `"~server_name~"` | Не в whitelist — не трогается |
 | `route.rules[0].domain` | `"~domain~"` | `"~domain~"` | Ключ `domain` не в whitelist — не трогается |
 
-### Важно: цепочка замены для ключа `server`
+### Приоритет для ключа `server`
 
 Ключ `server` входит в оба списка — `SINGBOX_ADDR_KEYS` и `SINGBOX_DOMAIN_KEYS`.
 Порядок проверки:
 
 1. **Значение == xui_address?** → `relay_address` (приоритет, для outbound)
-2. **Значение содержит `~domain~`?** → `domain_replace`
-   - Если после замены результат == xui_address → **`relay_address`** (цепочка)
-   - Иначе → `domain_replace` (для DNS и других секций)
+2. **Значение содержит `~domain~`?** → `domain_replace` (**конечное значение**, без цепочки)
 
-**Когда `DOMAIN_REPLACE` совпадает с одним из `XUI_ADDRESSES`**, цепочка сработает
-и DNS server тоже получит `relay_address`. Если DNS должен указывать на реальный сервер
-(а не relay), используйте для `DOMAIN_REPLACE` домен, **не входящий** в `XUI_ADDRESSES`.
-
-Пример конфигурации для раздельных значений:
+Это означает:
+- В **outbound** секции 3x-ui заменяет `~domain~` на реальный адрес сервера (IP/домен).
+  Если этот адрес в `XUI_ADDRESSES` — шаг 1 заменит его на `relay_address`. ✓
+- В **DNS** секции (шаблон добавлен вручную) `~domain~` остаётся как есть.
+  Шаг 3 заменит его на `DOMAIN_REPLACE` — это конечное значение для DNS. ✓
+- `DOMAIN_REPLACE` **можно безопасно задавать** совпадающим с `XUI_ADDRESSES` —
+  для DNS всегда останется `domain_replace`, цепочка до relay не выполняется.
 
 ```env
-# XUI_ADDRESSES содержит IP — для замены outbound server
-NL_XUI_ADDRESSES=44.44.44.44
+NL_XUI_ADDRESSES=44.44.44.44,xui-nl.example.com
+NL_RELAY_ADDRESS=relay.sslip.io
+NL_DOMAIN_REPLACE=xui-nl.example.com   # DNS server получит этот домен
+NL_DNS_PATH_REPLACE=/dns-query
 
-# DOMAIN_REPLACE — домен сервера (не IP, не в XUI_ADDRESSES)
-# DNS server получит этот домен напрямую
-NL_DOMAIN_REPLACE=xui-nl.example.com
-
-# А если нужно чтобы DNS тоже шёл через relay:
-# NL_XUI_ADDRESSES=44.44.44.44,xui-nl.example.com
-# NL_DOMAIN_REPLACE=xui-nl.example.com
-# → тогда DNS server тоже станет relay_address
+# Результат:
+# outbound server: 44.44.44.44       → relay.sslip.io    (шаг 1, ADDR_KEYS)
+# outbound server: xui-nl.example.com → relay.sslip.io    (шаг 1, ADDR_KEYS)
+# dns server:      ~domain~           → xui-nl.example.com (шаг 3, DOMAIN_KEYS)
+# dns path:        ~dnspath~           → /dns-query         (шаг 4, DNS_PATH_KEYS)
 ```
 
 ---
