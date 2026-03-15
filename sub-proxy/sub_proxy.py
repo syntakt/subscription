@@ -390,19 +390,51 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
                 _walk_and_replace(item, srv, depth + 1)
 
 
-def replace_in_json(data: dict, srv: ServerConfig) -> dict:
-    """Точечная замена в JSON-подписке (sing-box формат) по белым спискам ключей.
+def _override_dns_servers(data: dict, srv: ServerConfig) -> None:
+    """Переопределение server в dns.servers после основной замены.
 
-    Четыре независимых механизма замены:
-      SINGBOX_ADDR_KEYS   — xui_address → relay_address  (outbounds server)
-      SINGBOX_PORT_KEYS   — port_map замена              (outbounds server_port)
-      SINGBOX_DOMAIN_KEYS — ~domain~ → DOMAIN_REPLACE    (dns server и др.)
-      SINGBOX_DNS_PATH_KEYS — ~dnspath~ → DNS_PATH_REPLACE (dns path)
+    Проблема: 3x-ui заменяет ~domain~ на реальный адрес XUI-сервера ДО того,
+    как конфиг попадает в наш прокси. Поэтому _walk_and_replace (step 1,
+    ADDR_KEYS) заменяет dns.server на relay_address — а для DNS-over-HTTPS
+    нужен реальный домен сервера, не relay.
+
+    Решение: после _walk_and_replace обходим dns.servers[] и заменяем
+    relay_address → domain_replace для DNS-записей.
+    """
+    dns = data.get("dns")
+    if not isinstance(dns, dict):
+        return
+    servers = dns.get("servers")
+    if not isinstance(servers, list):
+        return
+    for entry in servers:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("server") == srv.relay_address:
+            entry["server"] = srv.domain_replace
+
+
+def replace_in_json(data: dict, srv: ServerConfig) -> dict:
+    """Точечная замена в JSON-подписке (sing-box формат).
+
+    Два этапа:
+      1. _walk_and_replace — рекурсивный обход по белым спискам ключей:
+           SINGBOX_ADDR_KEYS   — xui_address → relay_address  (outbounds)
+           SINGBOX_PORT_KEYS   — port_map замена
+           SINGBOX_DOMAIN_KEYS — ~domain~ → DOMAIN_REPLACE    (литералы)
+           SINGBOX_DNS_PATH_KEYS — ~dnspath~ → DNS_PATH_REPLACE
+
+      2. _override_dns_servers — post-processing секции dns.servers[]:
+           relay_address → DOMAIN_REPLACE (для DNS-over-HTTPS/TLS)
+           Нужен потому что 3x-ui заменяет ~domain~ на адрес XUI-сервера
+           до нашего прокси, и step 1 конвертирует его в relay.
 
     Не трогает: server_name (SNI), domain (routing rules), predefined (dns hosts),
     domain_suffix, ip_cidr и т.д.
     """
     _walk_and_replace(data, srv)
+    if srv.domain_replace:
+        _override_dns_servers(data, srv)
     return data
 
 

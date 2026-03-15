@@ -139,26 +139,36 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
+│  Этап 1: _walk_and_replace — рекурсивный обход JSON                    │
+│                                                                         │
 │  Шаг 1. SINGBOX_ADDR_KEYS (по умолчанию: server)                      │
 │  Если значение совпадает с одним из XUI_ADDRESSES → RELAY_ADDRESS      │
 │  Пример: "server": "44.44.44.44" → "server": "relay.sslip.io"         │
-├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
 │  Шаг 2. SINGBOX_PORT_KEYS (по умолчанию: server_port)                  │
 │  Если значение совпадает с портом из PORT_MAP → замена по маппингу      │
 │  Пример: "server_port": 443 → "server_port": 8443                     │
-├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
 │  Шаг 3. SINGBOX_DOMAIN_KEYS (по умолчанию: server)                     │
-│  Если значение содержит ~domain~ → заменяется на DOMAIN_REPLACE        │
-│  DOMAIN_REPLACE — всегда конечное значение (без цепочки до relay)       │
+│  Если значение содержит литерал ~domain~ → DOMAIN_REPLACE              │
 │  Пример: "server": "~domain~" → "server": "xui.example.com"           │
-├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
 │  Шаг 4. SINGBOX_DNS_PATH_KEYS (по умолчанию: path)                     │
-│  Если значение содержит ~dnspath~ → заменяется на DNS_PATH_REPLACE     │
+│  Если значение содержит литерал ~dnspath~ → DNS_PATH_REPLACE           │
 │  Пример: "path": "~dnspath~" → "path": "/dns-query"                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Этап 2: _override_dns_servers — post-processing DNS секции            │
+│  (только если DOMAIN_REPLACE задан)                                     │
+│                                                                         │
+│  В dns.servers[] заменяет relay_address → DOMAIN_REPLACE               │
+│  Нужен потому что 3x-ui сам заменяет ~domain~ на адрес XUI-сервера,    │
+│  и шаг 1 конвертирует его в relay (что неправильно для DNS).            │
+│  Пример: dns.server "relay.sslip.io" → "xui.example.com"              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Для каждого ключа срабатывает **первое подходящее правило** (приоритет сверху вниз).
+Для каждого ключа на этапе 1 срабатывает **первое подходящее правило** (приоритет сверху вниз).
+Этап 2 выполняется после и корректирует только DNS-записи.
 
 ### Что НЕ затрагивается
 
@@ -215,34 +225,32 @@ sudo nginx -t && sudo systemctl reload nginx
 }
 ```
 
-Результат после обработки (`DOMAIN_REPLACE=xui.example.com`, `DNS_PATH_REPLACE=/dns-query`,
-`XUI_ADDRESSES=xui.example.com`, `RELAY_ADDRESS=relay.sslip.io`, `PORT_MAP=443:8443`):
+Реальный поток данных (`DOMAIN_REPLACE=xui.example.com`, `DNS_PATH_REPLACE=/dns-query`,
+`XUI_ADDRESSES=44.44.44.44,xui.example.com`, `RELAY_ADDRESS=relay.sslip.io`, `PORT_MAP=443:8443`):
 
-| Место | До | После | Почему |
-|-------|-----|-------|--------|
-| `dns.servers[0].predefined` | `{"~domain~": "~ip~"}` | `{"~domain~": "~ip~"}` | Ключ объекта — не трогается |
-| `dns.servers[1].server` | `"~domain~"` | `"xui.example.com"` | DOMAIN_KEYS: `~domain~` → `domain_replace` (конечное значение) |
-| `dns.servers[1].path` | `"~dnspath~"` | `"/dns-query"` | DNS_PATH_KEYS |
-| `outbounds[0].server` | `"xui.example.com"` | `"relay.sslip.io"` | ADDR_KEYS (3x-ui уже заменил `~domain~`) |
-| `outbounds[0].server_port` | `443` | `8443` | PORT_KEYS |
-| `outbounds[0].tls.server_name` | `"~server_name~"` | `"~server_name~"` | Не в whitelist — не трогается |
-| `route.rules[0].domain` | `"~domain~"` | `"~domain~"` | Ключ `domain` не в whitelist — не трогается |
+**Важно:** 3x-ui заменяет `~domain~` на реальный адрес сервера **во всех секциях** (outbounds, dns, route).
+Плейсхолдер `~dnspath~` — пользовательский, 3x-ui его **не трогает**.
 
-### Приоритет для ключа `server`
+| Место | От 3x-ui | Этап 1 | Этап 2 (DNS) | Почему |
+|-------|----------|--------|-------------|--------|
+| `outbounds[0].server` | `"xui.example.com"` | `"relay.sslip.io"` | — | ADDR_KEYS: xui_addr → relay |
+| `outbounds[0].server_port` | `443` | `8443` | — | PORT_KEYS |
+| `dns.servers[4].server` | `"xui.example.com"` | `"relay.sslip.io"` | **`"xui.example.com"`** | Этап 2: relay → domain_replace |
+| `dns.servers[4].path` | `"~dnspath~"` | `"/dns-query"` | — | DNS_PATH_KEYS (литерал ~dnspath~) |
+| `dns.servers[3].predefined` | `{"xui.example.com": "44.44.44.44"}` | без изменений | — | Ключ объекта — не трогается |
+| `route.rules[].domain` | `"xui.example.com"` | без изменений | — | Ключ `domain` не в whitelist |
+| `outbounds[0].tls.server_name` | `"cdn.example.com"` | без изменений | — | Ключ `server_name` не в whitelist |
 
-Ключ `server` входит в оба списка — `SINGBOX_ADDR_KEYS` и `SINGBOX_DOMAIN_KEYS`.
-Порядок проверки:
+### Как работает для ключа `server`
 
-1. **Значение == xui_address?** → `relay_address` (приоритет, для outbound)
-2. **Значение содержит `~domain~`?** → `domain_replace` (**конечное значение**, без цепочки)
+Ключ `server` обрабатывается в **два этапа**:
 
-Это означает:
-- В **outbound** секции 3x-ui заменяет `~domain~` на реальный адрес сервера (IP/домен).
-  Если этот адрес в `XUI_ADDRESSES` — шаг 1 заменит его на `relay_address`. ✓
-- В **DNS** секции (шаблон добавлен вручную) `~domain~` остаётся как есть.
-  Шаг 3 заменит его на `DOMAIN_REPLACE` — это конечное значение для DNS. ✓
-- `DOMAIN_REPLACE` **можно безопасно задавать** совпадающим с `XUI_ADDRESSES` —
-  для DNS всегда останется `domain_replace`, цепочка до relay не выполняется.
+1. **Этап 1** (`_walk_and_replace`): xui_address → relay_address **везде** (outbounds, dns, route)
+2. **Этап 2** (`_override_dns_servers`): в `dns.servers[]` заменяет relay_address → domain_replace
+
+Результат:
+- **outbound** server = `relay_address` ✓ (трафик идёт через relay)
+- **DNS** server = `domain_replace` ✓ (DoH-запросы идут напрямую к серверу)
 
 ```env
 NL_XUI_ADDRESSES=44.44.44.44,xui-nl.example.com
@@ -251,10 +259,10 @@ NL_DOMAIN_REPLACE=xui-nl.example.com   # DNS server получит этот до
 NL_DNS_PATH_REPLACE=/dns-query
 
 # Результат:
-# outbound server: 44.44.44.44       → relay.sslip.io    (шаг 1, ADDR_KEYS)
-# outbound server: xui-nl.example.com → relay.sslip.io    (шаг 1, ADDR_KEYS)
-# dns server:      ~domain~           → xui-nl.example.com (шаг 3, DOMAIN_KEYS)
-# dns path:        ~dnspath~           → /dns-query         (шаг 4, DNS_PATH_KEYS)
+# outbound server: xui-nl.example.com → relay.sslip.io    (этап 1, ADDR_KEYS)
+# dns server:      xui-nl.example.com → relay.sslip.io    (этап 1, ADDR_KEYS)
+#                                      → xui-nl.example.com (этап 2, DNS override)
+# dns path:        ~dnspath~           → /dns-query         (этап 1, DNS_PATH_KEYS)
 ```
 
 ---
