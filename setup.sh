@@ -8,7 +8,11 @@
 #   1. Копирует sub_proxy.py и .env в /opt/sub-proxy/
 #   2. Устанавливает systemd unit
 #   3. Запускает сервис
-#   4. Показывает пример nginx location для добавления в конфиг
+#
+# nginx конфиги устанавливаются вручную:
+#   cp nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/
+#   cp nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/
+#   nginx -t && systemctl reload nginx
 #
 # Поддерживает два формата конфигурации:
 #   - Legacy (одиночный сервер): XUI_SUB_BASE_URL, RELAY_ADDRESS, ...
@@ -23,6 +27,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/sub-proxy"
+
+# ── Проверка root ──────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Скрипт должен быть запущен от root (sudo bash setup.sh)"
+    exit 1
+fi
 
 # ── Проверка .env ────────────────────────────────────────────────────────────
 if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
@@ -52,6 +62,7 @@ if [[ -n "${SERVERS:-}" ]]; then
         relay_var="${prefix}RELAY_ADDRESS"
         addrs_var="${prefix}XUI_ADDRESSES"
         path_var="${prefix}PATH_PREFIX"
+        port_map_var="${prefix}PORT_MAP"
 
         for var in "$url_var" "$relay_var" "$addrs_var"; do
             if [[ -z "${!var:-}" ]]; then
@@ -64,7 +75,7 @@ if [[ -n "${SERVERS:-}" ]]; then
         echo "    Upstream:    ${!url_var}"
         echo "    Relay addr:  ${!relay_var}"
         echo "    XUI addrs:   ${!addrs_var}"
-        echo "    Port map:    ${!prefix+"${prefix}PORT_MAP":-none}"
+        echo "    Port map:    ${!port_map_var:-none}"
         echo "    Path prefix: ${!path_var:-/xui-sub-${name,,}/}"
     done
 else
@@ -86,8 +97,8 @@ fi
 echo "  Listen:      ${SUB_PROXY_HOST:-127.0.0.1}:${SUB_PROXY_PORT:-9080}"
 echo ""
 
-# ── Установка файлов ─────────────────────────────────────────────────────────
-echo "[1/3] Копирую файлы в ${INSTALL_DIR}..."
+# ── Установка файлов sub-proxy ────────────────────────────────────────────────
+echo "[1/3] Копирую файлы sub-proxy в ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 cp "${SCRIPT_DIR}/sub-proxy/sub_proxy.py" "${INSTALL_DIR}/sub_proxy.py"
 cp "${SCRIPT_DIR}/.env" "${INSTALL_DIR}/.env"
@@ -118,12 +129,9 @@ fi
 echo ""
 echo "=== Готово! ==="
 echo ""
-echo "Добавьте в nginx конфиг (server { listen 5443 ssl; ... }):"
-echo "─────────────────────────────────────────────────────────"
-cat "${SCRIPT_DIR}/nginx/conf.d/subscription-relay.conf"
-echo "─────────────────────────────────────────────────────────"
-echo ""
-echo "После добавления:"
+echo "Не забудьте установить nginx конфиги вручную:"
+echo "  cp ${SCRIPT_DIR}/nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/"
+echo "  cp ${SCRIPT_DIR}/nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/"
 echo "  nginx -t && systemctl reload nginx"
 echo ""
 
