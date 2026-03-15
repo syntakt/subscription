@@ -160,6 +160,8 @@ class ServerConfig:
     xui_addresses: list[str]
     port_map: dict[str, str] = field(default_factory=dict)
     path_prefix: str = "/xui-sub/"
+    domain_replace: str = ""      # Замена ~domain~ → это значение (пусто = не заменять)
+    dns_path_replace: str = ""    # Замена ~dnspath~ → это значение (пусто = не заменять)
 
 
 def _parse_port_map(raw: str) -> dict[str, str]:
@@ -185,6 +187,8 @@ def _load_servers() -> list[ServerConfig]:
             xui_addresses=[a.strip() for a in os.environ["XUI_ADDRESSES"].split(",") if a.strip()],
             port_map=_parse_port_map(os.environ.get("PORT_MAP", "")),
             path_prefix=os.environ.get("ALLOWED_PATH_PREFIX", "/xui-sub/"),
+            domain_replace=os.environ.get("DOMAIN_REPLACE", ""),
+            dns_path_replace=os.environ.get("DNS_PATH_REPLACE", ""),
         )]
 
     # Мульти-сервер формат
@@ -205,6 +209,8 @@ def _load_servers() -> list[ServerConfig]:
             ],
             port_map=_parse_port_map(os.environ.get(f"{prefix}PORT_MAP", "")),
             path_prefix=os.environ.get(f"{prefix}PATH_PREFIX", f"/xui-sub-{name.lower()}/"),
+            domain_replace=os.environ.get(f"{prefix}DOMAIN_REPLACE", ""),
+            dns_path_replace=os.environ.get(f"{prefix}DNS_PATH_REPLACE", ""),
         ))
     return servers
 
@@ -291,6 +297,11 @@ def replace_in_json(data: dict, srv: ServerConfig) -> dict:
     for src_port, dst_port in srv.port_map.items():
         text = text.replace(f'"server_port":{src_port}', f'"server_port":{dst_port}')
         text = text.replace(f'"server_port": {src_port}', f'"server_port": {dst_port}')
+    # Замена плейсхолдеров ~domain~ и ~dnspath~ (если настроены)
+    if srv.domain_replace:
+        text = text.replace("~domain~", srv.domain_replace)
+    if srv.dns_path_replace:
+        text = text.replace("~dnspath~", srv.dns_path_replace)
     return json.loads(text)
 
 
@@ -511,6 +522,8 @@ def main():
         log.info("    Port map:   %s", srv.port_map or "(none)")
         log.info("    XUI addrs:  %s", srv.xui_addresses)
         log.info("    Path prefix: %s", srv.path_prefix)
+        log.info("    Domain replace: %s", srv.domain_replace or "(disabled)")
+        log.info("    DNS path replace: %s", srv.dns_path_replace or "(disabled)")
 
     server = HTTPServer((LISTEN_HOST, LISTEN_PORT), SubProxyHandler)
     try:
