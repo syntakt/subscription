@@ -84,6 +84,17 @@ SINGBOX_PORT_KEYS: set[str] = set(
     k.strip() for k in os.environ.get("SINGBOX_PORT_KEYS", "server_port").split(",") if k.strip()
 )
 
+# ── Белый список ключей для замены плейсхолдеров ~domain~ / ~dnspath~ ─────────
+# ~domain~ заменяется ТОЛЬКО в значениях ключей из SINGBOX_DOMAIN_KEYS.
+# ~dnspath~ заменяется ТОЛЬКО в значениях ключей из SINGBOX_DNS_PATH_KEYS.
+# Остальные ключи (domain, predefined, и т.д.) — не трогаются.
+SINGBOX_DOMAIN_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("SINGBOX_DOMAIN_KEYS", "server").split(",") if k.strip()
+)
+SINGBOX_DNS_PATH_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("SINGBOX_DNS_PATH_KEYS", "path").split(",") if k.strip()
+)
+
 # Максимальная глубина рекурсии при обходе JSON (защита от патологических конфигов)
 _MAX_JSON_DEPTH = 32
 
@@ -316,30 +327,33 @@ def _replace_vmess(uri: str, srv: ServerConfig) -> str:
 
 
 def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
-    """Рекурсивный обход JSON — замена адресов/портов ТОЛЬКО в ключах из белого списка.
+    """Рекурсивный обход JSON — замена адресов/портов/плейсхолдеров по белым спискам.
 
-    Обходит весь JSON-документ, но заменяет значения только если имя ключа
-    входит в SINGBOX_ADDR_KEYS (замена адреса) или SINGBOX_PORT_KEYS (замена порта).
+    Белые списки ключей:
+      SINGBOX_ADDR_KEYS  — замена xui_address → relay_address  (по умолчанию: server)
+      SINGBOX_PORT_KEYS  — замена порта по port_map            (по умолчанию: server_port)
+      SINGBOX_DOMAIN_KEYS — замена ~domain~ → DOMAIN_REPLACE   (по умолчанию: server)
+      SINGBOX_DNS_PATH_KEYS — замена ~dnspath~ → DNS_PATH_REPLACE (по умолчанию: path)
 
-    Дополнительно заменяет плейсхолдеры ~domain~ и ~dnspath~ в любых строковых
-    значениях (если DOMAIN_REPLACE / DNS_PATH_REPLACE настроены для сервера).
-    Это позволяет подставлять домен relay в секции DNS и другие шаблоны.
+    Порядок для ключа, входящего в несколько списков (например «server»):
+      1. Если значение совпадает с xui_address → relay_address (приоритет)
+      2. Иначе, если содержит ~domain~ → DOMAIN_REPLACE
 
-    Всё остальное (server_name, domain, domain_suffix, ip_cidr, и т.д.)
-    остаётся без изменений — relay пробрасывает TCP «как есть»,
-    TLS/REALITY работает end-to-end.
+    Всё остальное (server_name, domain, domain_suffix, ip_cidr, predefined и т.д.)
+    остаётся без изменений.
     """
     if depth > _MAX_JSON_DEPTH:
         return
 
     if isinstance(obj, dict):
         for key, value in obj.items():
-            # Замена адреса (белый список ключей)
+            # ── 1. Замена адреса (белый список SINGBOX_ADDR_KEYS) ──
             if key in SINGBOX_ADDR_KEYS and isinstance(value, str):
                 if value in srv.xui_addresses:
                     obj[key] = srv.relay_address
                     continue
-            # Замена порта (белый список ключей)
+
+            # ── 2. Замена порта (белый список SINGBOX_PORT_KEYS) ──
             if key in SINGBOX_PORT_KEYS and isinstance(value, (int, str)):
                 port_str = str(value)
                 if port_str in srv.port_map:
@@ -348,14 +362,21 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
                     except ValueError:
                         obj[key] = srv.port_map[port_str]
                     continue
-            # Замена плейсхолдеров ~domain~ / ~dnspath~ (в любых строковых значениях)
-            if isinstance(value, str):
+
+            # ── 3. Замена ~domain~ (белый список SINGBOX_DOMAIN_KEYS) ──
+            if key in SINGBOX_DOMAIN_KEYS and isinstance(value, str):
                 if srv.domain_replace and "~domain~" in value:
                     obj[key] = value.replace("~domain~", srv.domain_replace)
+                    continue
+
+            # ── 4. Замена ~dnspath~ (белый список SINGBOX_DNS_PATH_KEYS) ──
+            if key in SINGBOX_DNS_PATH_KEYS and isinstance(value, str):
                 if srv.dns_path_replace and "~dnspath~" in value:
-                    obj[key] = obj[key].replace("~dnspath~", srv.dns_path_replace)
-            # Рекурсия в вложенные объекты/массивы
-            elif isinstance(value, (dict, list)):
+                    obj[key] = value.replace("~dnspath~", srv.dns_path_replace)
+                    continue
+
+            # ── Рекурсия в вложенные объекты/массивы ──
+            if isinstance(value, (dict, list)):
                 _walk_and_replace(value, srv, depth + 1)
 
     elif isinstance(obj, list):
@@ -365,15 +386,16 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
 
 def replace_in_json(data: dict, srv: ServerConfig) -> dict:
-    """Точечная замена адресов в JSON-подписке (sing-box формат).
+    """Точечная замена в JSON-подписке (sing-box формат) по белым спискам ключей.
 
-    Заменяет адрес/порт только в ключах из белого списка (SINGBOX_ADDR_KEYS/PORT_KEYS).
-    По умолчанию: server, server_port.
-    Не трогает server_name (SNI), routing rules (domain, domain_suffix, ip_cidr и т.д.).
-    Настраивается через .env: SINGBOX_ADDR_KEYS, SINGBOX_PORT_KEYS.
+    Четыре независимых механизма замены:
+      SINGBOX_ADDR_KEYS   — xui_address → relay_address  (outbounds server)
+      SINGBOX_PORT_KEYS   — port_map замена              (outbounds server_port)
+      SINGBOX_DOMAIN_KEYS — ~domain~ → DOMAIN_REPLACE    (dns server и др.)
+      SINGBOX_DNS_PATH_KEYS — ~dnspath~ → DNS_PATH_REPLACE (dns path)
 
-    Дополнительно: замена плейсхолдеров ~domain~ и ~dnspath~ (если настроены
-    через DOMAIN_REPLACE / DNS_PATH_REPLACE) — для секций DNS.
+    Не трогает: server_name (SNI), domain (routing rules), predefined (dns hosts),
+    domain_suffix, ip_cidr и т.д.
     """
     _walk_and_replace(data, srv)
     return data
@@ -590,6 +612,8 @@ def main():
     log.info("  SSL verify: %s", UPSTREAM_SSL_VERIFY)
     log.info("  Sing-box addr keys: %s", SINGBOX_ADDR_KEYS)
     log.info("  Sing-box port keys: %s", SINGBOX_PORT_KEYS)
+    log.info("  Sing-box domain keys: %s", SINGBOX_DOMAIN_KEYS)
+    log.info("  Sing-box dns path keys: %s", SINGBOX_DNS_PATH_KEYS)
     log.info("  Servers: %d", len(SERVERS))
     for srv in SERVERS:
         log.info("  ── [%s] ──", srv.name)
