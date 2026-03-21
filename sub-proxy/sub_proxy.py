@@ -95,6 +95,17 @@ SINGBOX_DNS_PATH_KEYS: set[str] = set(
     k.strip() for k in os.environ.get("SINGBOX_DNS_PATH_KEYS", "path").split(",") if k.strip()
 )
 
+# ── Привязка замен адресов/портов к тегам (tag) ──────────────────────────────
+# Если задан — адреса и порты заменяются ТОЛЬКО в объектах с совпадающим "tag".
+# Пример: SINGBOX_REPLACE_TAGS=proxy → замена только в {"tag": "proxy", "server": ...}
+# DNS-записи (tag: dns-remote, dns_direct и т.д.) не затрагиваются.
+# Пустое значение / не задан → замена везде (обратная совместимость).
+_raw_replace_tags = os.environ.get("SINGBOX_REPLACE_TAGS", "").strip()
+SINGBOX_REPLACE_TAGS: set[str] | None = (
+    set(t.strip() for t in _raw_replace_tags.split(",") if t.strip())
+    if _raw_replace_tags else None
+)
+
 # Максимальная глубина рекурсии при обходе JSON (защита от патологических конфигов)
 _MAX_JSON_DEPTH = 32
 
@@ -149,7 +160,7 @@ def _rewrite_app_redirect(location: str, srv: "ServerConfig", external_base: str
     """Rewrite upstream URL inside app deep link to point through relay.
 
     Example input:
-      sing-box://import-remote-profile/?url=https://150.241.90.145/secret/base64...
+      sing-box://import-remote-profile/?url=https://xui-server/secret/base64...
     Output:
       sing-box://import-remote-profile/?url=https://relay:5443/xui-sub-de/base64...
     """
@@ -331,9 +342,20 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
     Белые списки ключей:
       SINGBOX_ADDR_KEYS  — замена xui_address → relay_address  (по умолчанию: server)
+                           Поддерживает и точное совпадение (server), и подстроку (url).
+                           Пример url: "https://xui.sslip.io/path" → "https://relay.sslip.io/path"
       SINGBOX_PORT_KEYS  — замена порта по port_map            (по умолчанию: server_port)
       SINGBOX_DOMAIN_KEYS — замена ~domain~ → DOMAIN_REPLACE   (по умолчанию: server)
       SINGBOX_DNS_PATH_KEYS — замена ~dnspath~ → DNS_PATH_REPLACE (по умолчанию: path)
+
+    Привязка к тегам (SINGBOX_REPLACE_TAGS):
+      Если задан — адреса/порты (шаги 1-2) заменяются ТОЛЬКО в объектах
+      с совпадающим "tag". DNS-записи (dns-remote, dns_direct и т.д.)
+      и прочие объекты не затрагиваются.
+      Если не задан — замена везде (обратная совместимость).
+
+    Плейсхолдеры ~domain~ / ~dnspath~ (шаги 3-4) заменяются всегда,
+    независимо от тегов — они используют литеральные маркеры.
 
     Порядок для ключа, входящего в несколько списков (например «server»):
       1. Если значение совпадает с xui_address → relay_address (приоритет)
@@ -346,15 +368,29 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
         return
 
     if isinstance(obj, dict):
+        # ── Проверка привязки к тегу ──
+        # Если SINGBOX_REPLACE_TAGS задан, адреса/порты заменяются только
+        # в объектах с подходящим "tag" (outbound proxy и т.д.).
+        # DNS-записи, inbounds и прочие объекты не затрагиваются.
+        tag_match = (
+            SINGBOX_REPLACE_TAGS is None
+            or obj.get("tag") in SINGBOX_REPLACE_TAGS
+        )
+
         for key, value in obj.items():
             # ── 1. Замена адреса (белый список SINGBOX_ADDR_KEYS) ──
-            if key in SINGBOX_ADDR_KEYS and isinstance(value, str):
-                if value in srv.xui_addresses:
-                    obj[key] = srv.relay_address
+            # Работает и для точных значений ("server": "xui.sslip.io"),
+            # и для подстрок в URL ("url": "https://xui.sslip.io/path").
+            if tag_match and key in SINGBOX_ADDR_KEYS and isinstance(value, str):
+                for xui_addr in srv.xui_addresses:
+                    if xui_addr in value:
+                        obj[key] = value.replace(xui_addr, srv.relay_address)
+                        break
+                if obj[key] != value:
                     continue
 
             # ── 2. Замена порта (белый список SINGBOX_PORT_KEYS) ──
-            if key in SINGBOX_PORT_KEYS and isinstance(value, (int, str)):
+            if tag_match and key in SINGBOX_PORT_KEYS and isinstance(value, (int, str)):
                 port_str = str(value)
                 if port_str in srv.port_map:
                     try:
@@ -417,23 +453,26 @@ def _override_dns_servers(data: dict, srv: ServerConfig) -> None:
 def replace_in_json(data: dict, srv: ServerConfig) -> dict:
     """Точечная замена в JSON-подписке (sing-box формат).
 
-    Два этапа:
-      1. _walk_and_replace — рекурсивный обход по белым спискам ключей:
-           SINGBOX_ADDR_KEYS   — xui_address → relay_address  (outbounds)
-           SINGBOX_PORT_KEYS   — port_map замена
-           SINGBOX_DOMAIN_KEYS — ~domain~ → DOMAIN_REPLACE    (литералы)
-           SINGBOX_DNS_PATH_KEYS — ~dnspath~ → DNS_PATH_REPLACE
+    Два режима:
+      A. Если SINGBOX_REPLACE_TAGS задан (рекомендуется):
+         _walk_and_replace заменяет адреса/порты ТОЛЬКО в объектах с совпадающим
+         "tag" (например, outbound "proxy"). DNS-записи, inbounds и прочие
+         объекты не затрагиваются — _override_dns_servers не нужен.
 
-      2. _override_dns_servers — post-processing секции dns.servers[]:
-           relay_address → DOMAIN_REPLACE (для DNS-over-HTTPS/TLS)
-           Нужен потому что 3x-ui заменяет ~domain~ на адрес XUI-сервера
-           до нашего прокси, и step 1 конвертирует его в relay.
+      B. Если SINGBOX_REPLACE_TAGS не задан (обратная совместимость):
+         1. _walk_and_replace — замена адресов/портов ВЕЗДЕ (как раньше).
+         2. _override_dns_servers — post-processing: в dns.servers[] заменяет
+            relay_address → DOMAIN_REPLACE (для DNS-over-HTTPS/TLS).
+
+    Плейсхолдеры ~domain~ / ~dnspath~ заменяются всегда, независимо от тегов.
 
     Не трогает: server_name (SNI), domain (routing rules), predefined (dns hosts),
     domain_suffix, ip_cidr и т.д.
     """
     _walk_and_replace(data, srv)
-    if srv.domain_replace:
+    # _override_dns_servers нужен только в legacy-режиме (без REPLACE_TAGS),
+    # когда адреса заменяются везде и DNS-записи нужно откатывать.
+    if srv.domain_replace and SINGBOX_REPLACE_TAGS is None:
         _override_dns_servers(data, srv)
     return data
 
@@ -651,6 +690,7 @@ def main():
     log.info("  Sing-box port keys: %s", SINGBOX_PORT_KEYS)
     log.info("  Sing-box domain keys: %s", SINGBOX_DOMAIN_KEYS)
     log.info("  Sing-box dns path keys: %s", SINGBOX_DNS_PATH_KEYS)
+    log.info("  Sing-box replace tags: %s", SINGBOX_REPLACE_TAGS or "(all — legacy mode)")
     log.info("  Servers: %d", len(SERVERS))
     for srv in SERVERS:
         log.info("  ── [%s] ──", srv.name)
