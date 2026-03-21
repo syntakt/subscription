@@ -160,7 +160,7 @@ def _rewrite_app_redirect(location: str, srv: "ServerConfig", external_base: str
     """Rewrite upstream URL inside app deep link to point through relay.
 
     Example input:
-      sing-box://import-remote-profile/?url=https://150.241.90.145/secret/base64...
+      sing-box://import-remote-profile/?url=https://xui-server/secret/base64...
     Output:
       sing-box://import-remote-profile/?url=https://relay:5443/xui-sub-de/base64...
     """
@@ -342,6 +342,8 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
     Белые списки ключей:
       SINGBOX_ADDR_KEYS  — замена xui_address → relay_address  (по умолчанию: server)
+                           Поддерживает и точное совпадение (server), и подстроку (url).
+                           Пример url: "https://xui.sslip.io/path" → "https://relay.sslip.io/path"
       SINGBOX_PORT_KEYS  — замена порта по port_map            (по умолчанию: server_port)
       SINGBOX_DOMAIN_KEYS — замена ~domain~ → DOMAIN_REPLACE   (по умолчанию: server)
       SINGBOX_DNS_PATH_KEYS — замена ~dnspath~ → DNS_PATH_REPLACE (по умолчанию: path)
@@ -377,9 +379,14 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
         for key, value in obj.items():
             # ── 1. Замена адреса (белый список SINGBOX_ADDR_KEYS) ──
+            # Работает и для точных значений ("server": "xui.sslip.io"),
+            # и для подстрок в URL ("url": "https://xui.sslip.io/path").
             if tag_match and key in SINGBOX_ADDR_KEYS and isinstance(value, str):
-                if value in srv.xui_addresses:
-                    obj[key] = srv.relay_address
+                for xui_addr in srv.xui_addresses:
+                    if xui_addr in value:
+                        obj[key] = value.replace(xui_addr, srv.relay_address)
+                        break
+                if obj[key] != value:
                     continue
 
             # ── 2. Замена порта (белый список SINGBOX_PORT_KEYS) ──
