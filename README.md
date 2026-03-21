@@ -90,10 +90,17 @@ sudo nginx -t && sudo systemctl reload nginx
 |---|---|---|
 | `SINGBOX_ADDR_KEYS` | Ключи для замены xui-адреса → relay | `server` |
 | `SINGBOX_PORT_KEYS` | Ключи для замены портов по PORT_MAP | `server_port` |
+| `SINGBOX_REPLACE_TAGS` | Теги объектов для замены адресов/портов | (пусто — везде) |
 | `SINGBOX_DOMAIN_KEYS` | Ключи для замены плейсхолдера `~domain~` | `server` |
 | `SINGBOX_DNS_PATH_KEYS` | Ключи для замены плейсхолдера `~dnspath~` | `path` |
 
 Значения через запятую, например: `SINGBOX_ADDR_KEYS=server,address`.
+
+**`SINGBOX_REPLACE_TAGS`** — привязка замен адресов/портов к тегам (рекомендуется).
+Если задан, адреса и порты заменяются только в объектах с совпадающим `"tag"`.
+DNS-записи, inbounds и прочие объекты не затрагиваются.
+Пример: `SINGBOX_REPLACE_TAGS=proxy` — замена только в outbound `"proxy"`.
+Если не задан — legacy-режим: замена везде + `_override_dns_servers` для коррекции DNS.
 
 ### Per-server настройки
 
@@ -139,36 +146,44 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Этап 1: _walk_and_replace — рекурсивный обход JSON                    │
+│  _walk_and_replace — рекурсивный обход JSON                             │
 │                                                                         │
 │  Шаг 1. SINGBOX_ADDR_KEYS (по умолчанию: server)                      │
 │  Если значение совпадает с одним из XUI_ADDRESSES → RELAY_ADDRESS      │
+│  ⚡ Только в объектах с tag из SINGBOX_REPLACE_TAGS (если задан)        │
 │  Пример: "server": "44.44.44.44" → "server": "relay.sslip.io"         │
 │                                                                         │
 │  Шаг 2. SINGBOX_PORT_KEYS (по умолчанию: server_port)                  │
 │  Если значение совпадает с портом из PORT_MAP → замена по маппингу      │
+│  ⚡ Только в объектах с tag из SINGBOX_REPLACE_TAGS (если задан)        │
 │  Пример: "server_port": 443 → "server_port": 8443                     │
 │                                                                         │
 │  Шаг 3. SINGBOX_DOMAIN_KEYS (по умолчанию: server)                     │
 │  Если значение содержит литерал ~domain~ → DOMAIN_REPLACE              │
+│  Работает везде, независимо от тегов                                    │
 │  Пример: "server": "~domain~" → "server": "xui.example.com"           │
 │                                                                         │
 │  Шаг 4. SINGBOX_DNS_PATH_KEYS (по умолчанию: path)                     │
 │  Если значение содержит литерал ~dnspath~ → DNS_PATH_REPLACE           │
+│  Работает везде, независимо от тегов                                    │
 │  Пример: "path": "~dnspath~" → "path": "/dns-query"                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Этап 2: _override_dns_servers — post-processing DNS секции            │
-│  (только если DOMAIN_REPLACE задан)                                     │
-│                                                                         │
-│  В dns.servers[] заменяет relay_address → DOMAIN_REPLACE               │
-│  Нужен потому что 3x-ui сам заменяет ~domain~ на адрес XUI-сервера,    │
-│  и шаг 1 конвертирует его в relay (что неправильно для DNS).            │
-│  Пример: dns.server "relay.sslip.io" → "xui.example.com"              │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Для каждого ключа на этапе 1 срабатывает **первое подходящее правило** (приоритет сверху вниз).
-Этап 2 выполняется после и корректирует только DNS-записи.
+### Два режима работы
+
+**A. С привязкой к тегам (рекомендуется):** `SINGBOX_REPLACE_TAGS=proxy`
+
+Адреса/порты заменяются только в объектах с совпадающим `"tag"`.
+DNS-записи (`dns-remote`, `dns_direct` и т.д.) не затрагиваются.
+`_override_dns_servers` не вызывается — нет необходимости.
+
+**B. Legacy-режим (обратная совместимость):** `SINGBOX_REPLACE_TAGS=` (пусто)
+
+Адреса/порты заменяются везде, затем `_override_dns_servers` корректирует
+`dns.servers[]`: relay_address → DOMAIN_REPLACE.
+
+Для каждого ключа срабатывает **первое подходящее правило** (приоритет сверху вниз).
 
 ### Что НЕ затрагивается
 
@@ -225,44 +240,43 @@ sudo nginx -t && sudo systemctl reload nginx
 }
 ```
 
-Реальный поток данных (`DOMAIN_REPLACE=xui.example.com`, `DNS_PATH_REPLACE=/dns-query`,
+Реальный поток данных (`SINGBOX_REPLACE_TAGS=proxy`, `DNS_PATH_REPLACE=/dns-query`,
 `XUI_ADDRESSES=44.44.44.44,xui.example.com`, `RELAY_ADDRESS=relay.sslip.io`, `PORT_MAP=443:8443`):
 
 **Важно:** 3x-ui заменяет `~domain~` на реальный адрес сервера **во всех секциях** (outbounds, dns, route).
 Плейсхолдер `~dnspath~` — пользовательский, 3x-ui его **не трогает**.
 
-| Место | От 3x-ui | Этап 1 | Этап 2 (DNS) | Почему |
-|-------|----------|--------|-------------|--------|
-| `outbounds[0].server` | `"xui.example.com"` | `"relay.sslip.io"` | — | ADDR_KEYS: xui_addr → relay |
-| `outbounds[0].server_port` | `443` | `8443` | — | PORT_KEYS |
-| `dns.servers[4].server` | `"xui.example.com"` | `"relay.sslip.io"` | **`"xui.example.com"`** | Этап 2: relay → domain_replace |
-| `dns.servers[4].path` | `"~dnspath~"` | `"/dns-query"` | — | DNS_PATH_KEYS (литерал ~dnspath~) |
-| `dns.servers[3].predefined` | `{"xui.example.com": "44.44.44.44"}` | без изменений | — | Ключ объекта — не трогается |
-| `route.rules[].domain` | `"xui.example.com"` | без изменений | — | Ключ `domain` не в whitelist |
-| `outbounds[0].tls.server_name` | `"cdn.example.com"` | без изменений | — | Ключ `server_name` не в whitelist |
+| Место | tag | От 3x-ui | Результат | Почему |
+|-------|-----|----------|-----------|--------|
+| `outbounds[0].server` | `proxy` | `"xui.example.com"` | `"relay.sslip.io"` | ADDR_KEYS + tag совпал |
+| `outbounds[0].server_port` | `proxy` | `443` | `8443` | PORT_KEYS + tag совпал |
+| `dns.servers[0].server` | `dns-remote` | `"8.8.8.8"` | `"8.8.8.8"` | tag НЕ совпал — не трогаем |
+| `dns.servers[4].server` | `dns_direct` | `"xui.example.com"` | `"xui.example.com"` | tag НЕ совпал — не трогаем |
+| `dns.servers[4].path` | `dns_direct` | `"~dnspath~"` | `"/dns-query"` | DNS_PATH_KEYS (без привязки к тегам) |
+| `dns.servers[3].predefined` | `dns-hosts` | `{"xui.example.com": "..."}` | без изменений | Ключ объекта — не трогается |
+| `outbounds[3].server` | `warpSOCKS5` | `"10.10.0.13"` | `"10.10.0.13"` | tag НЕ совпал — не трогаем |
+| `route.rules[].domain` | — | `"xui.example.com"` | без изменений | Ключ `domain` не в whitelist |
+| `outbounds[0].tls.server_name` | — | `"cdn.example.com"` | без изменений | Ключ `server_name` не в whitelist |
 
-### Как работает для ключа `server`
+### Как работает привязка к тегам
 
-Ключ `server` обрабатывается в **два этапа**:
-
-1. **Этап 1** (`_walk_and_replace`): xui_address → relay_address **везде** (outbounds, dns, route)
-2. **Этап 2** (`_override_dns_servers`): в `dns.servers[]` заменяет relay_address → domain_replace
-
-Результат:
-- **outbound** server = `relay_address` ✓ (трафик идёт через relay)
-- **DNS** server = `domain_replace` ✓ (DoH-запросы идут напрямую к серверу)
+С `SINGBOX_REPLACE_TAGS=proxy`:
+- Адреса/порты заменяются **только** в объектах с `"tag": "proxy"`
+- DNS-записи, warpSOCKS5, inbounds — не затрагиваются
+- Не нужен post-processing (`_override_dns_servers`)
 
 ```env
+SINGBOX_REPLACE_TAGS=proxy
 NL_XUI_ADDRESSES=44.44.44.44,xui-nl.example.com
 NL_RELAY_ADDRESS=relay.sslip.io
-NL_DOMAIN_REPLACE=xui-nl.example.com   # DNS server получит этот домен
 NL_DNS_PATH_REPLACE=/dns-query
 
 # Результат:
-# outbound server: xui-nl.example.com → relay.sslip.io    (этап 1, ADDR_KEYS)
-# dns server:      xui-nl.example.com → relay.sslip.io    (этап 1, ADDR_KEYS)
-#                                      → xui-nl.example.com (этап 2, DNS override)
-# dns path:        ~dnspath~           → /dns-query         (этап 1, DNS_PATH_KEYS)
+# outbound "proxy" server: xui-nl.example.com → relay.sslip.io  (tag совпал)
+# dns "dns_direct" server: xui-nl.example.com → без изменений    (tag НЕ совпал)
+# dns "dns-remote" server: 8.8.8.8            → без изменений    (tag НЕ совпал)
+# warpSOCKS5 server:       10.10.0.13         → без изменений    (tag НЕ совпал)
+# dns path:                ~dnspath~           → /dns-query       (без привязки к тегам)
 ```
 
 ---
