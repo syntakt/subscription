@@ -81,26 +81,49 @@ sudo nginx -t && sudo systemctl reload nginx
 | `UPSTREAM_SSL_VERIFY` | Проверка SSL-сертификата upstream | `true` |
 | `RELAY_PORT` | Порт relay для deep-link URL (глобальный) | `5443` |
 
-### Белый список ключей sing-box (глобальные)
+### Настройки замены в sing-box JSON (глобальные)
 
-Замена в JSON sing-box конфигах работает **только по белым спискам ключей**.
-Ключи, не входящие ни в один список, никогда не модифицируются.
+Замена в JSON sing-box конфигах работает по **двум осям**:
+1. **ГДЕ менять** — `SINGBOX_REPLACE_TAGS` (привязка к тегам объектов)
+2. **ЧТО менять** — `SINGBOX_ADDR_KEYS` / `SINGBOX_PORT_KEYS` (ключи JSON)
 
-| Переменная | Описание | По умолчанию |
+| Переменная | Что делает | Пример | По умолчанию |
+|---|---|---|---|
+| `SINGBOX_REPLACE_TAGS` | В каких тегах заменять адрес/порт | `proxy` | (пусто — везде) |
+| `SINGBOX_ADDR_KEYS` | Какие JSON-ключи содержат адрес | `server` | `server` |
+| `SINGBOX_PORT_KEYS` | Какие JSON-ключи содержат порт | `server_port` | `server_port` |
+| `SINGBOX_DOMAIN_KEYS` | Ключи для замены `~domain~` | `server` | `server` |
+| `SINGBOX_DNS_PATH_KEYS` | Ключи для замены `~dnspath~` | `path` | `path` |
+
+Значения через запятую, например: `SINGBOX_REPLACE_TAGS=proxy,warpSOCKS5`.
+
+**Как переменные работают вместе:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Для каждого объекта в JSON:                                        │
+│                                                                     │
+│  1. Проверяем "tag" объекта                                        │
+│     ├─ tag ∈ SINGBOX_REPLACE_TAGS? → Заменяем адрес и порт:        │
+│     │   • "server"      ∈ XUI_ADDRESSES → RELAY_ADDRESS            │
+│     │   • "server_port" ∈ PORT_MAP      → mapped port              │
+│     └─ tag НЕ совпал?   → Пропускаем адрес/порт                   │
+│                                                                     │
+│  2. Плейсхолдеры (ВСЕГДА, независимо от тегов):                    │
+│     • "server" содержит ~domain~  → DOMAIN_REPLACE                 │
+│     • "path"   содержит ~dnspath~ → DNS_PATH_REPLACE               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Per-server переменные (НА ЧТО менять):**
+
+| Переменная | Что делает | Пример |
 |---|---|---|
-| `SINGBOX_ADDR_KEYS` | Ключи для замены xui-адреса → relay | `server` |
-| `SINGBOX_PORT_KEYS` | Ключи для замены портов по PORT_MAP | `server_port` |
-| `SINGBOX_REPLACE_TAGS` | Теги объектов для замены адресов/портов | (пусто — везде) |
-| `SINGBOX_DOMAIN_KEYS` | Ключи для замены плейсхолдера `~domain~` | `server` |
-| `SINGBOX_DNS_PATH_KEYS` | Ключи для замены плейсхолдера `~dnspath~` | `path` |
-
-Значения через запятую, например: `SINGBOX_ADDR_KEYS=server,address`.
-
-**`SINGBOX_REPLACE_TAGS`** — привязка замен адресов/портов к тегам (рекомендуется).
-Если задан, адреса и порты заменяются только в объектах с совпадающим `"tag"`.
-DNS-записи, inbounds и прочие объекты не затрагиваются.
-Пример: `SINGBOX_REPLACE_TAGS=proxy` — замена только в outbound `"proxy"`.
-Если не задан — legacy-режим: замена везде + `_override_dns_servers` для коррекции DNS.
+| `RELAY_ADDRESS` | На что заменять адрес (IP или домен) | `193-233-231-208.sslip.io` |
+| `XUI_ADDRESSES` | Какие адреса искать для замены | `150.241.90.145,150-241-90-145.sslip.io` |
+| `PORT_MAP` | Маппинг портов src:dst | `443:8443` |
+| `DOMAIN_REPLACE` | Значение для `~domain~` | `xui.example.com` |
+| `DNS_PATH_REPLACE` | Значение для `~dnspath~` | `/dns-query` |
 
 ### Per-server настройки
 
