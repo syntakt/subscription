@@ -6,7 +6,7 @@
 ## Схема работы
 
 ```
-Клиент                     nginx (relay:5443)            sub_proxy.py            3x-ui (NL/DE/...)
+Клиент                     nginx (relay:443)             sub_proxy.py            3x-ui (NL/DE/...)
   │                              │                            │                      │
   │  GET /<prefix>/<token>       │                            │                      │
   │ ────────────────────────────>│  proxy_pass :9080           │                      │
@@ -21,7 +21,7 @@
   │ <────────────────────────────│                            │                        │
 ```
 
-1. Клиент получает ссылку подписки: `https://relay:5443/<prefix>/<token>`
+1. Клиент получает ссылку подписки: `https://relay/<prefix>/<token>`
 2. nginx проксирует на локальный `sub_proxy.py` (127.0.0.1:9080)
 3. `sub_proxy.py` определяет upstream сервер по prefix, забирает подписку, заменяет адреса/порты/плейсхолдеры
 4. Клиент получает конфиг с адресом relay-сервера
@@ -42,8 +42,8 @@
 
 | Сервер | Prefix | Формат подписки | Ссылка подписки |
 |--------|--------|-----------------|-----------------|
-| NL | `/xui-sub/` | токен в пути | `https://relay:5443/xui-sub/<token>` |
-| DE | `/xui-sub-de/` | параметры в query | `https://relay:5443/xui-sub-de/?t=si&s=<UUID>` |
+| NL | `/xui-sub/` | токен в пути | `https://relay/xui-sub/<token>` |
+| DE | `/xui-sub-de/` | параметры в query | `https://relay/xui-sub-de/?t=si&s=<UUID>` |
 
 Роутинг выполняет `sub_proxy.py` — один процесс обрабатывает все серверы.
 
@@ -60,8 +60,7 @@ nano .env
 # 3. Установить (systemd + копирование файлов)
 sudo bash setup.sh
 
-# 4. Добавить location-блоки в nginx конфиг
-#    (setup.sh покажет что именно добавить)
+# 4. Установить nginx конфиги, которые покажет setup.sh
 
 # 5. Перезагрузить nginx
 sudo nginx -t && sudo systemctl reload nginx
@@ -79,7 +78,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | `SUB_PROXY_PORT` | Порт sub_proxy.py | `9080` |
 | `UPSTREAM_TIMEOUT` | Таймаут запроса к upstream (сек, макс 60) | `10` |
 | `UPSTREAM_SSL_VERIFY` | Проверка SSL-сертификата upstream | `true` |
-| `RELAY_PORT` | Порт relay для deep-link URL (глобальный) | `5443` |
+| `RELAY_PORT` | Порт relay для deep-link URL (глобальный) | `443` |
 
 ### Настройки замены в sing-box JSON (глобальные)
 
@@ -137,7 +136,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | `RELAY_ADDRESS` | Адрес relay для подстановки | `11.11.11.11.sslip.io` |
 | `XUI_ADDRESSES` | IP/домены 3x-ui для замены | `44.44.44.44,xui.sslip.io` |
 | `PORT_MAP` | Маппинг портов XUI:RELAY | `443:8443,4443:9443` |
-| `RELAY_PORT` | Порт relay для deep-link URL | `5443` |
+| `RELAY_PORT` | Порт relay для deep-link URL | `443` |
 | `DOMAIN_REPLACE` | Значение для `~domain~` (пусто = отключено) | `xui.example.com` |
 | `DNS_PATH_REPLACE` | Значение для `~dnspath~` (пусто = отключено) | `/dns-query` |
 
@@ -172,7 +171,7 @@ sudo nginx -t && sudo systemctl reload nginx
 │  _walk_and_replace — рекурсивный обход JSON                             │
 │                                                                         │
 │  Шаг 1. SINGBOX_ADDR_KEYS (по умолчанию: server)                      │
-│  Если значение совпадает/содержит один из XUI_ADDRESSES → RELAY_ADDRESS│
+│  Если server совпал или hostname URL совпал с XUI_ADDRESSES → RELAY_ADDRESS│
 │  ⚡ Только в объектах с tag из SINGBOX_REPLACE_TAGS (если задан)        │
 │  Точное: "server": "44.44.44.44" → "server": "relay.sslip.io"         │
 │  Подстрока: "url": "https://44.44.44.44/p" → "https://relay.sslip.io/p"│
@@ -275,8 +274,8 @@ DNS-записи (`dns-remote`, `dns_direct` и т.д.) не затрагива�
 |-------|-----|----------|-----------|--------|
 | `outbounds[0].server` | `proxy` | `"xui.example.com"` | `"relay.sslip.io"` | tag совпал, server ∈ ADDR_KEYS |
 | `outbounds[0].server_port` | `proxy` | `443` | `8443` | tag совпал, PORT_MAP |
-| `rule_set "pac".url` | `pac` | `"https://xui.example.com/abc"` | `"https://relay.sslip.io/abc"` | tag совпал, url ∈ ADDR_KEYS, подстрока |
-| `rule_set "subnet".url` | `subnet` | `"https://xui.example.com/xyz"` | `"https://relay.sslip.io/xyz"` | tag совпал, url ∈ ADDR_KEYS, подстрока |
+| `rule_set "pac".url` | `pac` | `"https://xui.example.com/abc"` | `"https://relay.sslip.io/abc"` | tag совпал, url ∈ ADDR_KEYS, hostname совпал |
+| `rule_set "subnet".url` | `subnet` | `"https://xui.example.com/xyz"` | `"https://relay.sslip.io/xyz"` | tag совпал, url ∈ ADDR_KEYS, hostname совпал |
 | `rule_set "proxy:86400s:..."` | `proxy:86400s:...` | `...github.com/...` | без изменений | tag НЕ совпал (точное сравнение) |
 | `dns.servers[0].server` | `dns-remote` | `"8.8.8.8"` | `"8.8.8.8"` | tag НЕ совпал |
 | `dns.servers[4].server` | `dns_direct` | `"xui.example.com"` | `"xui.example.com"` | tag НЕ совпал |
@@ -299,7 +298,7 @@ NL_PORT_MAP=443:8443
 # Результат:
 # outbound "proxy" server: xui-nl.example.com → relay.sslip.io  (tag совпал)
 # outbound "proxy" server_port: 443 → 8443                       (tag совпал, PORT_MAP)
-# rule_set "pac" url: https://xui-nl.example.com/... → https://relay.sslip.io/...  (подстрока)
+# rule_set "pac" url: https://xui-nl.example.com/... → https://relay.sslip.io/...  (hostname совпал)
 # rule_set "proxy:86400s:..." url: https://github.com/... → без изменений  (tag НЕ совпал!)
 # dns "dns_direct" server: xui-nl.example.com → без изменений    (tag НЕ совпал)
 # dns "dns-remote" server: 8.8.8.8            → без изменений    (tag НЕ совпал)
@@ -319,9 +318,9 @@ NL_PORT_MAP=443:8443
 │   └── sub-proxy.service             # systemd unit
 └── nginx/
     └── conf.d/
-        ├── vpn-proxy.conf            # Основной nginx конфиг
-        ├── sub-proxy-common.inc      # Общие настройки proxy
-        └── subscription-relay.inc    # Location-блоки для relay
+        ├── nginx.conf                # Глобальный nginx конфиг
+        ├── vpn-proxy.conf            # Основной relay server-блок
+        └── sub-proxy-common.inc      # Общие настройки proxy для подписок
 ```
 
 ## Управление
@@ -338,13 +337,13 @@ sudo cp .env /opt/sub-proxy/.env
 sudo systemctl restart sub-proxy
 
 # Тест (NL, токен в пути)
-curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | base64 -d
+curl -sk https://127.0.0.1/xui-sub/<TOKEN> | base64 -d
 
 # Тест (DE, query формат)
-curl -sk "https://127.0.0.1:5443/xui-sub-de/?t=si&r=si&s=<UUID>" | base64 -d
+curl -sk "https://127.0.0.1/xui-sub-de/?t=si&r=si&s=<UUID>" | base64 -d
 
 # Тест (sing-box JSON — если upstream отдаёт JSON)
-curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | python3 -m json.tool
+curl -sk https://127.0.0.1/xui-sub/<TOKEN> | python3 -m json.tool
 ```
 
 ## Добавление нового сервера
@@ -384,7 +383,7 @@ sing-box://import-remote-profile/?url=https://xui-server/sub/token
 
 Proxy автоматически перезаписывает внутренний URL на relay:
 ```
-sing-box://import-remote-profile/?url=https://relay:5443/xui-sub/token
+sing-box://import-remote-profile/?url=https://relay/xui-sub/token
 ```
 
 Порт relay в deep link формируется из `RELAY_PORT` (глобальный) или `<NAME>_RELAY_PORT` (per-server).
