@@ -3,12 +3,16 @@
 Проксирование подписок 3x-ui через relay-сервер с подменой адресов, портов
 и DNS-плейсхолдеров. Поддерживает несколько upstream 3x-ui серверов через один relay.
 
+Проект состоит из локального Python-сервиса `sub_proxy.py`, hardened systemd unit
+и nginx-конфига, который принимает публичный HTTPS-трафик на relay-домене и
+проксирует только разрешённые path prefix на `127.0.0.1:9080`.
+
 ## Схема работы
 
 ```
 Клиент                     nginx (relay:443)             sub_proxy.py            3x-ui (NL/DE/...)
   │                              │                            │                      │
-  │  GET /<prefix>/<token>       │                            │                      │
+  │  GET/HEAD /<prefix>/<token>  │                            │                      │
   │ ────────────────────────────>│  proxy_pass :9080           │                      │
   │                              │ ──────────────────────────>│  роутинг по prefix    │
   │                              │                            │  GET /<token>          │
@@ -22,7 +26,8 @@
 ```
 
 1. Клиент получает ссылку подписки: `https://relay/<prefix>/<token>`
-2. nginx проксирует на локальный `sub_proxy.py` (127.0.0.1:9080)
+2. nginx принимает запрос только на настроенном `server_name` и проксирует
+   разрешённые prefix на локальный `sub_proxy.py` (`127.0.0.1:9080`)
 3. `sub_proxy.py` определяет upstream сервер по prefix, забирает подписку, заменяет адреса/порты/плейсхолдеры
 4. Клиент получает конфиг с адресом relay-сервера
 5. VPN-трафик идёт через relay (nftables DNAT)
@@ -31,7 +36,7 @@
 
 | Формат | Описание |
 |--------|----------|
-| **JSON (sing-box)** | Рекурсивный обход JSON с заменой по белым спискам ключей |
+| **JSON (sing-box)** | Рекурсивный обход JSON-объекта или массива с заменой по белым спискам ключей |
 | **base64** | Декодирование, замена адресов/портов в каждой URI, кодирование обратно |
 | **plain text** | Замена адресов/портов в URI-строках (vless://, vmess://, trojan://, ss://) |
 
@@ -60,11 +65,44 @@ nano .env
 # 3. Установить (systemd + копирование файлов)
 sudo bash setup.sh
 
-# 4. Установить nginx конфиги, которые покажет setup.sh
+# 4. Установить nginx конфиги
+sudo cp nginx/conf.d/nginx.conf /etc/nginx/nginx.conf
+sudo cp nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/
+sudo cp nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/
 
 # 5. Перезагрузить nginx
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+В `nginx/conf.d/vpn-proxy.conf` перед установкой замените example-домены:
+
+| Значение | Что заменить |
+|---|---|
+| `relay.example.com` | Публичный домен relay-сервера |
+| `bot.example.com` | Upstream для опциональных `/info/` и `/dl/` location-блоков |
+
+Если `/info/` и `/dl/` не используются, удалите эти location-блоки из
+`vpn-proxy.conf` перед установкой — для подписок они не нужны.
+
+## Nginx
+
+Репозиторий содержит полноценный пример nginx-конфигурации:
+
+| Файл | Назначение |
+|---|---|
+| `nginx/conf.d/nginx.conf` | Глобальные настройки http{}, TLS, safe logging, rate/conn zones |
+| `nginx/conf.d/vpn-proxy.conf` | Публичный relay server-блок на 443 |
+| `nginx/conf.d/sub-proxy-common.inc` | Общий include для `/xui-sub*/` locations |
+
+Ключевые свойства nginx-конфига:
+
+- `default_server` возвращает `444` для неизвестных Host/SNI и прямых IP-сканов.
+- Логи используют `$safe_uri`: query string не пишется, path-токены заменяются на `<token>`.
+- `/xui-sub*/` проксируются только на `127.0.0.1:9080`.
+- `X-Forwarded-*` и `X-Accel-Redirect` очищаются перед локальным Python backend.
+- Для подписок включены `Cache-Control: no-store`, `X-Robots-Tag: noindex, nofollow` и `Content-Security-Policy: default-src 'none'`.
+- `/info/` использует строгий CSP без `unsafe-inline`: `style-src 'self'`.
+- `Strict-Transport-Security` включает `includeSubDomains`; оставляйте это только если все поддомены обслуживаются по HTTPS.
 
 ---
 
@@ -174,7 +212,7 @@ sudo nginx -t && sudo systemctl reload nginx
 │  Если server совпал или hostname URL совпал с XUI_ADDRESSES → RELAY_ADDRESS│
 │  ⚡ Только в объектах с tag из SINGBOX_REPLACE_TAGS (если задан)        │
 │  Точное: "server": "44.44.44.44" → "server": "relay.sslip.io"         │
-│  Подстрока: "url": "https://44.44.44.44/p" → "https://relay.sslip.io/p"│
+│  URL hostname: "https://44.44.44.44/p" → "https://relay.sslip.io/p"    │
 │                                                                         │
 │  Шаг 2. SINGBOX_PORT_KEYS (по умолчанию: server_port)                  │
 │  Если значение совпадает с портом из PORT_MAP → замена по маппингу      │
@@ -336,14 +374,18 @@ sudo journalctl -u sub-proxy -f
 sudo cp .env /opt/sub-proxy/.env
 sudo systemctl restart sub-proxy
 
-# Тест (NL, токен в пути)
-curl -sk https://127.0.0.1/xui-sub/<TOKEN> | base64 -d
+# Тест через nginx на сервере без изменения DNS.
+# relay.example.com должен совпадать с server_name и сертификатом.
+curl -sk --resolve relay.example.com:443:127.0.0.1 \
+  https://relay.example.com/xui-sub/<TOKEN> | base64 -d
 
-# Тест (DE, query формат)
-curl -sk "https://127.0.0.1/xui-sub-de/?t=si&r=si&s=<UUID>" | base64 -d
+# Query формат
+curl -sk --resolve relay.example.com:443:127.0.0.1 \
+  "https://relay.example.com/xui-sub-de/?t=si&r=si&s=<UUID>" | base64 -d
 
-# Тест (sing-box JSON — если upstream отдаёт JSON)
-curl -sk https://127.0.0.1/xui-sub/<TOKEN> | python3 -m json.tool
+# sing-box JSON — если upstream отдаёт JSON
+curl -sk --resolve relay.example.com:443:127.0.0.1 \
+  https://relay.example.com/xui-sub/<TOKEN> | python3 -m json.tool
 ```
 
 ## Добавление нового сервера
@@ -387,13 +429,31 @@ sing-box://import-remote-profile/?url=https://relay/xui-sub/token
 ```
 
 Порт relay в deep link формируется из `RELAY_PORT` (глобальный) или `<NAME>_RELAY_PORT` (per-server).
+Если порт равен `443`, он не добавляется в URL.
+
+## Redirect policy
+
+`sub_proxy.py` отключает автоматическое следование редиректам в `urllib` и
+проверяет их вручную:
+
+- HTTP(S)-редирект разрешён только внутри того же `scheme://host:port`, что и исходный upstream.
+- Дополнительно редирект должен оставаться внутри настроенного `XUI_SUB_BASE_URL` path base.
+- Path нормализуется перед проверкой, поэтому редиректы через `../` не обходят base path.
+- App deep link разрешён только для известных схем (`sing-box://`, `clash://`, `clash-meta://`, `hiddify://`, `v2ray://`, `v2rayng://`).
+- Внутренний `url=` в app deep link переписывается на relay только если он указывает внутрь `XUI_SUB_BASE_URL`; иначе редирект блокируется.
+- URL в логах маскируются: query скрывается, последний path-сегмент заменяется на `****`.
 
 ## Безопасность
 
-- `.env` файл содержит секреты — **не коммитьте** его в git (добавлен в `.gitignore`)
-- Пути запросов валидируются: только разрешённые prefix, без path traversal
-- Токены маскируются в логах: `abcd****efgh`
-- SSL-сертификат upstream проверяется по умолчанию (`UPSTREAM_SSL_VERIFY=true`)
-- Размер ответа от upstream ограничен (`MAX_RESPONSE_SIZE`, по умолчанию 5 МБ)
-- Заголовки безопасности: `no-store`, `nosniff`, `noindex`
-- Deep link redirects: только разрешённые схемы (`sing-box://`, `clash://` и др.)
+- `.env` содержит upstream URL, адреса и токенизированные пути — **не коммитьте** его в git.
+- `setup.sh` читает `.env` как `KEY=VALUE` и не исполняет его через `source`.
+- Python backend слушает `127.0.0.1:9080` по умолчанию; наружу его публикует только nginx.
+- Пути запросов валидируются: только разрешённые prefix, без NUL, path traversal и опасных символов.
+- Query string прокидывается к upstream, но в nginx-логах не пишется.
+- Токены и secret path в Python-логах маскируются как `****`.
+- SSL-сертификат upstream проверяется по умолчанию (`UPSTREAM_SSL_VERIFY=true`).
+- Размер ответа от upstream ограничен (`MAX_RESPONSE_SIZE`, по умолчанию 5 МБ, максимум 50 МБ).
+- Обычные HTTP(S)-редиректы ограничены same-origin и base path.
+- App deep link redirects ограничены разрешёнными схемами и безопасным `url=`.
+- Nginx отдаёт generic `404`/`502` для ошибок backend и не показывает HTML `BaseHTTPRequestHandler.send_error()`.
+- Для подписок выставляются `no-store`, `nosniff`, `noindex`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.

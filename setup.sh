@@ -178,6 +178,10 @@ format_relay_url() {
     printf 'https://%s%s%s<TOKEN>' "$address" "$port_suffix" "$path"
 }
 
+test_addr=""
+test_port="${RELAY_PORT:-443}"
+test_path="/xui-sub/"
+
 if [[ -n "${SERVERS:-}" ]]; then
     IFS=',' read -ra SERVER_LIST <<< "${SERVERS}"
     echo "Ссылки подписки для клиентов:"
@@ -190,14 +194,22 @@ if [[ -n "${SERVERS:-}" ]]; then
         relay_addr="${!relay_var}"
         relay_port="${!relay_port_var:-${RELAY_PORT:-443}}"
         echo "  [${name}] $(format_relay_url "$relay_addr" "$relay_port" "$path")"
+        if [[ -z "$test_addr" ]]; then
+            test_addr="$relay_addr"
+            test_port="$relay_port"
+            test_path="$path"
+        fi
     done
 else
     echo "Ссылка подписки для клиента:"
     echo "  $(format_relay_url "$RELAY_ADDRESS" "${RELAY_PORT:-443}" "/xui-sub/")"
+    test_addr="$RELAY_ADDRESS"
+    test_port="${RELAY_PORT:-443}"
 fi
 
 echo ""
 echo "  Где <TOKEN> — токен клиента из 3x-ui панели."
 echo ""
 echo "Тест:"
-echo "  curl -sk https://127.0.0.1/xui-sub/<TOKEN> | base64 -d"
+echo "  curl -sk --resolve ${test_addr}:${test_port}:127.0.0.1 \\"
+echo "    $(format_relay_url "$test_addr" "$test_port" "$test_path") | base64 -d"
