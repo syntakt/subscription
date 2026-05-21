@@ -10,6 +10,7 @@
 #   3. Запускает сервис
 #
 # nginx конфиги устанавливаются вручную:
+#   cp nginx/conf.d/nginx.conf /etc/nginx/nginx.conf
 #   cp nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/
 #   cp nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/
 #   nginx -t && systemctl reload nginx
@@ -43,9 +44,37 @@ if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
 fi
 
 # Проверка обязательных переменных
-set -a
-source "${SCRIPT_DIR}/.env"
-set +a
+load_env_file() {
+    local env_file="$1"
+    local line key value first last
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            echo "ERROR: Некорректная строка в .env: ${line}"
+            exit 1
+        fi
+
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        if [[ ${#value} -ge 2 ]]; then
+            first="${value:0:1}"
+            last="${value: -1}"
+            if [[ "$first" == "$last" && ( "$first" == '"' || "$first" == "'" ) ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+
+        export "$key=$value"
+    done < "$env_file"
+}
+
+load_env_file "${SCRIPT_DIR}/.env"
 
 if [[ -n "${SERVERS:-}" ]]; then
     # Мульти-сервер формат
@@ -130,10 +159,28 @@ echo ""
 echo "=== Готово! ==="
 echo ""
 echo "Не забудьте установить nginx конфиги вручную:"
+echo "  cp ${SCRIPT_DIR}/nginx/conf.d/nginx.conf /etc/nginx/nginx.conf"
 echo "  cp ${SCRIPT_DIR}/nginx/conf.d/vpn-proxy.conf /etc/nginx/conf.d/"
 echo "  cp ${SCRIPT_DIR}/nginx/conf.d/sub-proxy-common.inc /etc/nginx/conf.d/"
 echo "  nginx -t && systemctl reload nginx"
 echo ""
+
+format_relay_url() {
+    local address="$1"
+    local port="$2"
+    local path="$3"
+    local port_suffix=""
+
+    if [[ -n "$port" && "$port" != "443" ]]; then
+        port_suffix=":${port}"
+    fi
+
+    printf 'https://%s%s%s<TOKEN>' "$address" "$port_suffix" "$path"
+}
+
+test_addr=""
+test_port="${RELAY_PORT:-443}"
+test_path="/xui-sub/"
 
 if [[ -n "${SERVERS:-}" ]]; then
     IFS=',' read -ra SERVER_LIST <<< "${SERVERS}"
@@ -141,16 +188,28 @@ if [[ -n "${SERVERS:-}" ]]; then
     for name in "${SERVER_LIST[@]}"; do
         name="$(echo "$name" | tr '[:lower:]' '[:upper:]' | xargs)"
         path_var="${name}_PATH_PREFIX"
+        relay_var="${name}_RELAY_ADDRESS"
+        relay_port_var="${name}_RELAY_PORT"
         path="${!path_var:-/xui-sub-${name,,}/}"
-        echo "  [${name}] https://\${RELAY_ADDRESS}:5443${path}<TOKEN>"
+        relay_addr="${!relay_var}"
+        relay_port="${!relay_port_var:-${RELAY_PORT:-443}}"
+        echo "  [${name}] $(format_relay_url "$relay_addr" "$relay_port" "$path")"
+        if [[ -z "$test_addr" ]]; then
+            test_addr="$relay_addr"
+            test_port="$relay_port"
+            test_path="$path"
+        fi
     done
 else
     echo "Ссылка подписки для клиента:"
-    echo "  https://\${RELAY_ADDRESS}:5443/xui-sub/<TOKEN>"
+    echo "  $(format_relay_url "$RELAY_ADDRESS" "${RELAY_PORT:-443}" "/xui-sub/")"
+    test_addr="$RELAY_ADDRESS"
+    test_port="${RELAY_PORT:-443}"
 fi
 
 echo ""
 echo "  Где <TOKEN> — токен клиента из 3x-ui панели."
 echo ""
 echo "Тест:"
-echo "  curl -sk https://127.0.0.1:5443/xui-sub/<TOKEN> | base64 -d"
+echo "  curl -sk --resolve ${test_addr}:${test_port}:127.0.0.1 \\"
+echo "    $(format_relay_url "$test_addr" "$test_port" "$test_path") | base64 -d"

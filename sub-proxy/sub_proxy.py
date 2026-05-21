@@ -32,7 +32,7 @@ import sys
 import urllib.parse
 import urllib.request
 import ssl
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from dataclasses import dataclass, field
 
 # ── Конфигурация ────────────────────────────────────────────────────────────
@@ -69,8 +69,15 @@ if not UPSTREAM_SSL_VERIFY:
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Disable urllib's implicit redirect following; redirects are validated manually."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 _ssl_handler = urllib.request.HTTPSHandler(context=ssl_ctx)
-_opener = urllib.request.build_opener(_ssl_handler)
+_opener = urllib.request.build_opener(_ssl_handler, _NoRedirectHandler)
 
 
 # ── Настройка ключей замены для sing-box JSON ────────────────────────────────
@@ -121,13 +128,106 @@ class _AppRedirect(Exception):
         self.location = location
 
 
-def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
+def _effective_origin(url: str) -> tuple[str, str, int] | None:
+    """Return normalized (scheme, hostname, effective_port) for HTTP(S) URLs."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.scheme, parsed.hostname.lower(), port
+    except ValueError:
+        return None
+
+
+def _is_same_origin_redirect(candidate: str, initial_origin: tuple[str, str, int]) -> bool:
+    """Allow HTTP(S) redirects only inside the configured upstream origin."""
+    return _effective_origin(candidate) == initial_origin
+
+
+def _url_is_under_base(candidate: str, base: str) -> bool:
+    """Return true when candidate is inside the configured upstream subscription base."""
+    if _effective_origin(candidate) != _effective_origin(base):
+        return False
+
+    def normalized_path(url: str) -> str:
+        parsed_path = urllib.parse.urlparse(url).path or "/"
+        decoded_path = urllib.parse.unquote(parsed_path)
+        normalized = posixpath.normpath(decoded_path)
+        if not normalized.startswith("/"):
+            normalized = "/" + normalized
+        return normalized.rstrip("/")
+
+    candidate_path = normalized_path(candidate)
+    base_path = normalized_path(base)
+    if not base_path:
+        return True
+    return candidate_path == base_path or candidate_path.startswith(base_path + "/")
+
+
+def _is_allowed_app_scheme(url: str) -> bool:
+    return url.lower().startswith(_ALLOWED_APP_SCHEMES)
+
+
+def _mask_path_for_log(path: str) -> str:
+    """Mask the last path segment, which is usually a subscription/download token."""
+    parts = path.rstrip("/").split("/")
+    if parts:
+        token = parts[-1]
+        if token:
+            parts[-1] = "****"
+    return "/".join(parts)
+
+
+def _mask_url_for_log(raw_url: str, max_len: int = 160) -> str:
+    """Mask token-like path/query values before logging URLs and app links."""
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except Exception:
+        return raw_url[:max_len]
+
+    if _is_allowed_app_scheme(raw_url):
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if "url" in qs:
+            qs["url"] = [_mask_url_for_log(qs["url"][0])]
+        masked = urllib.parse.urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path, parsed.params,
+            urllib.parse.urlencode(qs, doseq=True), parsed.fragment,
+        ))
+        return masked[:max_len]
+
+    if parsed.scheme in ("http", "https"):
+        netloc = parsed.hostname or ""
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port:
+            netloc = f"{netloc}:{port}"
+        path = _mask_path_for_log(parsed.path or "/")
+        if parsed.query:
+            path += "?..."
+        return urllib.parse.urlunparse((parsed.scheme, netloc, path, "", "", ""))[:max_len]
+
+    masked = _mask_path_for_log(raw_url)
+    return (masked + "?..." if "?" in raw_url else masked)[:max_len]
+
+
+def _fetch_with_redirects(
+    url: str,
+    headers: dict,
+    max_redirects: int = 5,
+    allowed_base: str | None = None,
+):
     """Fetch URL, manually following HTTP(S) redirects.
 
     App deep-link redirects (sing-box://, clash://) are raised as _AppRedirect
     so the caller can rewrite and pass them through to the client.
     """
     visited: set[str] = set()
+    initial_origin = _effective_origin(url)
+    if initial_origin is None:
+        raise urllib.error.URLError("Invalid upstream URL")
 
     for _ in range(max_redirects + 1):
         if url in visited:
@@ -144,11 +244,18 @@ def _fetch_with_redirects(url: str, headers: dict, max_redirects: int = 5):
                     raise
                 resolved = urllib.parse.urljoin(url, location)
                 # App deep links — don't follow, let caller handle
-                if not resolved.startswith(("http://", "https://")) and \
-                   resolved.startswith(_ALLOWED_APP_SCHEMES):
-                    log.info("  ↳ app redirect %d → %s", e.code, resolved[:120])
+                if _is_allowed_app_scheme(resolved):
+                    log.info("  ↳ app redirect %d → %s", e.code, _mask_url_for_log(resolved))
                     raise _AppRedirect(e.code, resolved)
-                log.info("  ↳ following %d → %s", e.code, resolved[:120])
+                if not _is_same_origin_redirect(resolved, initial_origin):
+                    log.warning("  ↳ blocked cross-origin redirect %d → %s",
+                                e.code, _mask_url_for_log(resolved))
+                    raise urllib.error.URLError("Blocked cross-origin upstream redirect")
+                if allowed_base and not _url_is_under_base(resolved, allowed_base.rstrip("/")):
+                    log.warning("  ↳ blocked out-of-base redirect %d → %s",
+                                e.code, _mask_url_for_log(resolved))
+                    raise urllib.error.URLError("Blocked out-of-base upstream redirect")
+                log.info("  ↳ following %d → %s", e.code, _mask_url_for_log(resolved))
                 url = resolved
                 continue
             raise
@@ -162,7 +269,7 @@ def _rewrite_app_redirect(location: str, srv: "ServerConfig", external_base: str
     Example input:
       sing-box://import-remote-profile/?url=https://xui-server/secret/base64...
     Output:
-      sing-box://import-remote-profile/?url=https://relay:5443/xui-sub-de/base64...
+      sing-box://import-remote-profile/?url=https://relay/xui-sub-de/base64...
     """
     parsed = urllib.parse.urlparse(location)
     qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -175,8 +282,10 @@ def _rewrite_app_redirect(location: str, srv: "ServerConfig", external_base: str
     # Replace upstream base URL with relay's external base + path prefix
     upstream_base = srv.xui_sub_base_url.rstrip("/")
     relay_base = external_base.rstrip("/") + srv.path_prefix.rstrip("/")
-    if inner_url.startswith(upstream_base):
+    if _url_is_under_base(inner_url, upstream_base):
         inner_url = relay_base + inner_url[len(upstream_base):]
+    else:
+        raise ValueError("app redirect inner URL is outside upstream base")
 
     qs["url"] = [inner_url]
     new_query = urllib.parse.urlencode(qs, doseq=True)
@@ -308,6 +417,33 @@ def replace_address_in_uri(uri: str, srv: ServerConfig) -> str:
     return uri
 
 
+def _replace_url_host(value: str, srv: ServerConfig) -> str:
+    """Replace only the URL hostname when it exactly matches a configured XUI address."""
+    try:
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return value
+        if parsed.hostname not in srv.xui_addresses:
+            return value
+
+        netloc = srv.relay_address
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return urllib.parse.urlunparse((
+            parsed.scheme, netloc, parsed.path, parsed.params,
+            parsed.query, parsed.fragment,
+        ))
+    except ValueError:
+        return value
+
+
+def _replace_address_value(value: str, srv: ServerConfig) -> str:
+    """Replace exact server values, and URL hostnames, without substring rewriting."""
+    if value in srv.xui_addresses:
+        return srv.relay_address
+    return _replace_url_host(value, srv)
+
+
 def _replace_vmess(uri: str, srv: ServerConfig) -> str:
     """Обработка vmess:// URI (base64 JSON внутри)."""
     try:
@@ -342,7 +478,7 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
     Белые списки ключей:
       SINGBOX_ADDR_KEYS  — замена xui_address → relay_address  (по умолчанию: server)
-                           Поддерживает и точное совпадение (server), и подстроку (url).
+                           Поддерживает точное значение server и hostname в URL.
                            Пример url: "https://xui.sslip.io/path" → "https://relay.sslip.io/path"
       SINGBOX_PORT_KEYS  — замена порта по port_map            (по умолчанию: server_port)
       SINGBOX_DOMAIN_KEYS — замена ~domain~ → DOMAIN_REPLACE   (по умолчанию: server)
@@ -379,13 +515,10 @@ def _walk_and_replace(obj, srv: ServerConfig, depth: int = 0) -> None:
 
         for key, value in obj.items():
             # ── 1. Замена адреса (белый список SINGBOX_ADDR_KEYS) ──
-            # Работает и для точных значений ("server": "xui.sslip.io"),
-            # и для подстрок в URL ("url": "https://xui.sslip.io/path").
+            # Работает для точных значений ("server": "xui.sslip.io")
+            # и для hostname в URL ("url": "https://xui.sslip.io/path").
             if tag_match and key in SINGBOX_ADDR_KEYS and isinstance(value, str):
-                for xui_addr in srv.xui_addresses:
-                    if xui_addr in value:
-                        obj[key] = value.replace(xui_addr, srv.relay_address)
-                        break
+                obj[key] = _replace_address_value(value, srv)
                 if obj[key] != value:
                     continue
 
@@ -450,7 +583,7 @@ def _override_dns_servers(data: dict, srv: ServerConfig) -> None:
             entry["server"] = srv.domain_replace
 
 
-def replace_in_json(data: dict, srv: ServerConfig) -> dict:
+def replace_in_json(data, srv: ServerConfig):
     """Точечная замена в JSON-подписке (sing-box формат).
 
     Два режима:
@@ -472,7 +605,7 @@ def replace_in_json(data: dict, srv: ServerConfig) -> dict:
     _walk_and_replace(data, srv)
     # _override_dns_servers нужен только в legacy-режиме (без REPLACE_TAGS),
     # когда адреса заменяются везде и DNS-записи нужно откатывать.
-    if srv.domain_replace and SINGBOX_REPLACE_TAGS is None:
+    if isinstance(data, dict) and srv.domain_replace and SINGBOX_REPLACE_TAGS is None:
         _override_dns_servers(data, srv)
     return data
 
@@ -555,15 +688,8 @@ def _sanitize_path(raw_path: str, allowed_prefixes: list[str]) -> tuple[str, str
 
 def _mask_token(path: str) -> str:
     """Маскирует токен в пути и query для безопасного логирования."""
-    # Маскируем последний сегмент пути
-    parts = path.rstrip("/").split("/")
-    if len(parts) > 0:
-        token = parts[-1]
-        if len(token) > 8:
-            parts[-1] = token[:4] + "****" + token[-4:]
-        elif len(token) > 0:
-            parts[-1] = "****"
-    masked = "/".join(parts)
+    path_part = path.split("?", 1)[0]
+    masked = _mask_path_for_log(path_part)
     # Если есть query — показываем только ключи параметров
     return masked + "?..." if "?" in path else masked
 
@@ -579,12 +705,33 @@ class SubProxyHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def do_GET(self):
+        self._handle_proxy(send_body=True)
+
+    def do_HEAD(self):
+        self._handle_proxy(send_body=False)
+
+    def _send_plain_error(self, code: int, message: str) -> None:
+        body = f"{message}\n".encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    @staticmethod
+    def _safe_header_value(value: str) -> str:
+        return re.sub(r"[\r\n]+", " ", value)
+
+    def _handle_proxy(self, send_body: bool) -> None:
         # ── Валидация пути ──
         result = _sanitize_path(self.path, ALLOWED_PREFIXES)
         if result is None:
             log.warning("Blocked suspicious path from %s: %s",
                         self.address_string(), self.path[:200])
-            self.send_error(400, "Bad Request")
+            self._send_plain_error(400, "Bad Request")
             return
 
         safe_path, query_string = result
@@ -594,7 +741,7 @@ class SubProxyHandler(BaseHTTPRequestHandler):
         if srv is None:
             log.warning("No server matched path from %s: %s",
                         self.address_string(), safe_path[:200])
-            self.send_error(404, "Not Found")
+            self._send_plain_error(404, "Not Found")
             return
 
         # Стрипаем prefix, оставляем только токен/путь
@@ -616,6 +763,7 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             resp = _fetch_with_redirects(
                 upstream_url,
                 headers={"User-Agent": self.headers.get("User-Agent", "SubProxy/1.0")},
+                allowed_base=srv.xui_sub_base_url,
             )
 
             status = resp.status
@@ -624,22 +772,28 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             content_length = resp.headers.get("Content-Length")
             if content_length and content_length.isdigit() and int(content_length) > MAX_RESPONSE_SIZE:
                 log.error("Upstream response too large: %s bytes", content_length)
-                self.send_error(502, "Bad Gateway")
+                self._send_plain_error(502, "Bad Gateway")
                 return
 
             body = resp.read(MAX_RESPONSE_SIZE + 1)
             if len(body) > MAX_RESPONSE_SIZE:
                 log.error("Upstream response exceeded size limit")
-                self.send_error(502, "Bad Gateway")
+                self._send_plain_error(502, "Bad Gateway")
                 return
 
         except _AppRedirect as r:
             # App deep link (sing-box://, clash://) — rewrite inner URL and pass 302 to client
             # Use relay_address from config, NOT client-supplied Host (prevents open redirect)
             external_base = srv.external_base_url
-            rewritten = _rewrite_app_redirect(r.location, srv, external_base)
+            try:
+                rewritten = _rewrite_app_redirect(r.location, srv, external_base)
+            except ValueError:
+                log.warning("[%s] Blocked unsafe app redirect: %s",
+                            srv.name, _mask_url_for_log(r.location))
+                self._send_plain_error(502, "Bad Gateway")
+                return
             log.info("[%s] App redirect %d → %s (rewritten)", srv.name, r.code,
-                     rewritten[:120])
+                     _mask_url_for_log(rewritten))
             self.send_response(r.code)
             self.send_header("Location", rewritten)
             self.send_header("Content-Length", "0")
@@ -647,19 +801,24 @@ class SubProxyHandler(BaseHTTPRequestHandler):
             return
         except urllib.error.HTTPError as e:
             log.error("[%s] Upstream HTTP %d for %s", srv.name, e.code, _mask_token(safe_path))
-            self.send_error(e.code if e.code in (400, 404) else 502, "Error")
+            self._send_plain_error(e.code if e.code in (400, 404) else 502, "Error")
             return
         except Exception as e:
             log.error("[%s] Upstream error: %s", srv.name, type(e).__name__)
-            self.send_error(502, "Bad Gateway")
+            self._send_plain_error(502, "Bad Gateway")
             return
 
         # Трансформация
-        transformed = transform_subscription(body, ct, srv)
+        try:
+            transformed = transform_subscription(body, ct, srv)
+        except Exception as e:
+            log.error("[%s] Transform error: %s", srv.name, type(e).__name__)
+            self._send_plain_error(502, "Bad Gateway")
+            return
 
         # Ответ клиенту
         self.send_response(status)
-        self.send_header("Content-Type", ct or "text/plain; charset=utf-8")
+        self.send_header("Content-Type", self._safe_header_value(ct or "text/plain; charset=utf-8"))
         self.send_header("Content-Length", str(len(transformed)))
 
         # ── Заголовки безопасности ──
@@ -672,9 +831,10 @@ class SubProxyHandler(BaseHTTPRequestHandler):
                      "content-disposition", "profile-title"):
             val = resp.headers.get(hdr)
             if val:
-                self.send_header(hdr, val)
+                self.send_header(hdr, self._safe_header_value(val))
         self.end_headers()
-        self.wfile.write(transformed)
+        if send_body:
+            self.wfile.write(transformed)
 
     def log_message(self, format, *args):
         log.info("%s %s", self.address_string(), format % args)
@@ -694,7 +854,7 @@ def main():
     log.info("  Servers: %d", len(SERVERS))
     for srv in SERVERS:
         log.info("  ── [%s] ──", srv.name)
-        log.info("    Upstream:   %s", srv.xui_sub_base_url)
+        log.info("    Upstream:   %s", _mask_url_for_log(srv.xui_sub_base_url))
         log.info("    Relay addr: %s", srv.relay_address)
         log.info("    Relay port: %s", srv.relay_port or "(default 443)")
         log.info("    Port map:   %s", srv.port_map or "(none)")
@@ -703,7 +863,7 @@ def main():
         log.info("    Domain replace: %s", srv.domain_replace or "(disabled)")
         log.info("    DNS path replace: %s", srv.dns_path_replace or "(disabled)")
 
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), SubProxyHandler)
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), SubProxyHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
