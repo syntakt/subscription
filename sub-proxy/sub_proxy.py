@@ -11,6 +11,7 @@ Nginx проксирует запросы клиентов на этот пор�
 Поддерживаемые форматы подписки:
   - base64 (список URI: vless://, vmess://, trojan://, ss://)
   - JSON (sing-box формат)
+  - YAML (mihomo / Clash.Meta формат — заменяются server: и port: в proxies:)
   - plain text (URI per line)
 
 Маппинг адресов/портов настраивается через переменные окружения.
@@ -111,6 +112,17 @@ _raw_replace_tags = os.environ.get("SINGBOX_REPLACE_TAGS", "").strip()
 SINGBOX_REPLACE_TAGS: set[str] | None = (
     set(t.strip() for t in _raw_replace_tags.split(",") if t.strip())
     if _raw_replace_tags else None
+)
+
+# ── Настройка ключей замены для mihomo / Clash.Meta YAML ─────────────────────
+# Имена YAML-ключей внутри блока proxies:, в которых заменяются адрес и порт.
+# Замена идёт по имени ключа (точное совпадение), а НЕ по подстроке — поэтому
+# server: затрагивается, а servername:/server_port: и т.п. остаются нетронутыми.
+CLASH_ADDR_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("CLASH_ADDR_KEYS", "server").split(",") if k.strip()
+)
+CLASH_PORT_KEYS: set[str] = set(
+    k.strip() for k in os.environ.get("CLASH_PORT_KEYS", "port").split(",") if k.strip()
 )
 
 # Максимальная глубина рекурсии при обходе JSON (защита от патологических конфигов)
@@ -610,6 +622,118 @@ def replace_in_json(data, srv: ServerConfig):
     return data
 
 
+# ── mihomo / Clash.Meta (YAML) ───────────────────────────────────────────────
+
+def _build_clash_key_re(keys: set[str]) -> "re.Pattern[str] | None":
+    """Собрать regex `<key>: <value>` для заданного набора имён ключей.
+
+    Совпадает с ключом только как с цельным словом (negative lookbehind по
+    [\\w.-]), поэтому `server` не матчит `servername`, а `port` не матчит
+    `mixed-port`/`support`. Захватываются:
+      group(1) — префикс «ключ: » (с двоеточием и пробелами),
+      group(2) — открывающая кавычка (' или " или пусто),
+      group(3) — значение (до кавычки/пробела/запятой/`}`/комментария),
+      \\2      — закрывающая кавычка (та же, что открывающая).
+    """
+    if not keys:
+        return None
+    alt = "|".join(re.escape(k) for k in sorted(keys))
+    return re.compile(
+        rf'((?<![\w.-])(?:{alt})\s*:\s*)(["\']?)([^"\'\s,}}#]+)\2'
+    )
+
+
+_CLASH_ADDR_RE = _build_clash_key_re(CLASH_ADDR_KEYS)
+_CLASH_PORT_RE = _build_clash_key_re(CLASH_PORT_KEYS)
+# Начало блока proxies: (block- или flow-style), с учётом отступа.
+_CLASH_PROXIES_RE = re.compile(r"^(\s*)proxies\s*:(.*)$")
+
+
+def _clash_replace_line(line: str, srv: ServerConfig) -> str:
+    """Заменить server/port в одной строке YAML внутри блока proxies:.
+
+    Адрес меняется только при ТОЧНОМ совпадении значения с одним из
+    XUI_ADDRESSES; порт — только если значение есть в PORT_MAP. Кавычки
+    (если были) сохраняются.
+    """
+
+    def repl_addr(m: "re.Match[str]") -> str:
+        prefix, quote, value = m.group(1), m.group(2), m.group(3)
+        if value in srv.xui_addresses:
+            return f"{prefix}{quote}{srv.relay_address}{quote}"
+        return m.group(0)
+
+    def repl_port(m: "re.Match[str]") -> str:
+        prefix, quote, value = m.group(1), m.group(2), m.group(3)
+        if value in srv.port_map:
+            return f"{prefix}{quote}{srv.port_map[value]}{quote}"
+        return m.group(0)
+
+    if _CLASH_ADDR_RE is not None:
+        line = _CLASH_ADDR_RE.sub(repl_addr, line)
+    if _CLASH_PORT_RE is not None:
+        line = _CLASH_PORT_RE.sub(repl_port, line)
+    return line
+
+
+def replace_in_clash(text: str, srv: ServerConfig) -> str:
+    """Замена server/port в mihomo / Clash.Meta YAML-подписке.
+
+    Замена ограничена блоком proxies: — отслеживается по отступу, чтобы НЕ
+    задеть верхнеуровневые port:/mixed-port:/socks-port: и `server:` в иных
+    секциях. Внутри блока меняются только ключи CLASH_ADDR_KEYS (server) и
+    CLASH_PORT_KEYS (port); servername:/sni: и т.п. остаются нетронутыми.
+
+    Без зависимостей (PyYAML не используется): построчная обработка сохраняет
+    исходное форматирование, комментарии и порядок ключей. Поддерживаются
+    block-style (по одному ключу на строку) и flow-style ({server: ..., port: ...}).
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    in_proxies = False
+    proxies_indent = 0
+
+    for line in lines:
+        if not in_proxies:
+            m = _CLASH_PROXIES_RE.match(line)
+            if m:
+                proxies_indent = len(m.group(1))
+                in_proxies = True
+                # Возможен inline flow-list на той же строке: proxies: [ {...} ]
+                if m.group(2).strip():
+                    line = _clash_replace_line(line, srv)
+            out.append(line)
+            continue
+
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            out.append(line)
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if indent <= proxies_indent:
+            # Блок proxies: закончился — началась соседняя/родительская секция.
+            in_proxies = False
+            out.append(line)
+            continue
+
+        out.append(_clash_replace_line(line, srv))
+
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _looks_like_clash(text: str, content_type: str) -> bool:
+    """Эвристика: подписка в формате mihomo / Clash.Meta (YAML)."""
+    ct = content_type.lower()
+    if any(t in ct for t in ("yaml", "x-yaml", "clash")):
+        return True
+    # Сигнатура Clash-конфига — ключ proxies: на отдельной строке.
+    return bool(re.search(r"(?m)^\s*proxies\s*:", text))
+
+
 def transform_subscription(raw_body: bytes, content_type: str, srv: ServerConfig) -> bytes:
     """Трансформировать тело подписки: заменить адреса и порты."""
 
@@ -623,6 +747,10 @@ def transform_subscription(raw_body: bytes, content_type: str, srv: ServerConfig
             return json.dumps(result, ensure_ascii=False, indent=2).encode()
         except json.JSONDecodeError:
             pass
+
+    # Попробовать YAML (mihomo / Clash.Meta) — заменяем server:/port: в proxies:
+    if _looks_like_clash(text, content_type):
+        return replace_in_clash(text, srv).encode()
 
     # Попробовать base64 (стандартная подписка v2ray/xray)
     try:
@@ -851,6 +979,8 @@ def main():
     log.info("  Sing-box domain keys: %s", SINGBOX_DOMAIN_KEYS)
     log.info("  Sing-box dns path keys: %s", SINGBOX_DNS_PATH_KEYS)
     log.info("  Sing-box replace tags: %s", SINGBOX_REPLACE_TAGS or "(all — legacy mode)")
+    log.info("  Clash addr keys: %s", CLASH_ADDR_KEYS)
+    log.info("  Clash port keys: %s", CLASH_PORT_KEYS)
     log.info("  Servers: %d", len(SERVERS))
     for srv in SERVERS:
         log.info("  ── [%s] ──", srv.name)

@@ -37,6 +37,7 @@
 | Формат | Описание |
 |--------|----------|
 | **JSON (sing-box)** | Рекурсивный обход JSON-объекта или массива с заменой по белым спискам ключей |
+| **YAML (mihomo / Clash.Meta)** | Замена `server:`/`port:` внутри блока `proxies:` (по именам ключей `CLASH_ADDR_KEYS` / `CLASH_PORT_KEYS`) |
 | **base64** | Декодирование, замена адресов/портов в каждой URI, кодирование обратно |
 | **plain text** | Замена адресов/портов в URI-строках (vless://, vmess://, trojan://, ss://) |
 
@@ -342,6 +343,51 @@ NL_PORT_MAP=443:8443
 # dns "dns-remote" server: 8.8.8.8            → без изменений    (tag НЕ совпал)
 # warpSOCKS5 server:       10.10.0.13         → без изменений    (tag НЕ совпал)
 ```
+
+---
+
+## Замена в mihomo / Clash.Meta (YAML)
+
+### Как работает
+
+YAML-подписка определяется по `Content-Type` (`*yaml*` / `*clash*`) или по
+наличию строки `proxies:`. `sub_proxy.py` обрабатывает её **построчно** (без
+PyYAML — форматирование, комментарии и порядок ключей сохраняются) и заменяет
+только внутри блока `proxies:`:
+
+| Что | Переменная | По умолчанию | Действие |
+|-----|------------|--------------|----------|
+| Адрес | `CLASH_ADDR_KEYS` | `server` | значение `== XUI_ADDRESSES` → `RELAY_ADDRESS` |
+| Порт  | `CLASH_PORT_KEYS` | `port`   | значение есть в `PORT_MAP` → новый порт |
+
+Замена идёт по **имени ключа** (точное совпадение), а не по подстроке.
+
+### Что НЕ затрагивается
+
+- `servername:` / `sni:` — это TLS SNI, остаются исходными (даже если значение
+  совпадает с адресом сервера).
+- `reality-opts`, `ws-opts`, `uuid`, `public-key` и пр. — не трогаются.
+- Верхнеуровневые `port:` / `mixed-port:` / `socks-port:` / `redir-port:`
+  (вне блока `proxies:`) — не трогаются (привязка к блоку `proxies:` по отступу).
+
+### Пример
+
+`XUI_ADDRESSES=xui.example.com`, `RELAY_ADDRESS=relay.example.com`,
+`PORT_MAP=443:8443`:
+
+```yaml
+proxies:
+    - name: proxy
+      type: vless
+      port: 443                          # → 8443        (внутри proxies:, PORT_MAP)
+      server: xui.example.com     # → relay.example.com  (CLASH_ADDR_KEYS)
+      servername: xui.example.com # → без изменений (SNI, не адрес)
+      flow: xtls-rprx-vision
+port: 7890                               # → без изменений (верхний уровень)
+```
+
+Поддерживаются и block-style (по одному ключу на строку), и flow-style
+(`- {name: a, server: ..., port: ...}`).
 
 ---
 
