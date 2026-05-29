@@ -418,11 +418,16 @@ def replace_address_in_uri(uri: str, srv: ServerConfig) -> str:
             continue
         uri = uri.replace(f"@{xui_addr}:", f"@{srv.relay_address}:")
 
-    # Заменяем порты
-    for src_port, dst_port in srv.port_map.items():
+    # Заменяем порт. Один проход с callback — иначе последовательные re.sub
+    # могут зацепить уже заменённый порт (напр. PORT_MAP=443:8443,8443:9443
+    # превратил бы :443 → :8443 → :9443).
+    if srv.port_map:
+        def _sub_port(m: "re.Match[str]") -> str:
+            return f"@{srv.relay_address}:{srv.port_map.get(m.group(1), m.group(1))}"
+
         uri = re.sub(
-            rf"@{re.escape(srv.relay_address)}:{src_port}(?=\?|#|$)",
-            f"@{srv.relay_address}:{dst_port}",
+            rf"@{re.escape(srv.relay_address)}:(\d+)(?=\?|#|$)",
+            _sub_port,
             uri,
         )
 
