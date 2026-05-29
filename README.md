@@ -98,12 +98,14 @@ sudo nginx -t && sudo systemctl reload nginx
 Ключевые свойства nginx-конфига:
 
 - `default_server` возвращает `444` для неизвестных Host/SNI и прямых IP-сканов.
+- HTTP (:80) `default_server` отдаёт только `301` на HTTPS — перекрывает дефолтный сайт и закрывает plaintext.
 - Логи используют `$safe_uri`: query string не пишется, path-токены заменяются на `<token>`.
-- `/xui-sub*/` проксируются только на `127.0.0.1:9080`.
+- `/xui-sub*/` проксируются только на `127.0.0.1:9080`; для них отключён `gzip` (тело содержит секреты клиента).
 - `X-Forwarded-*` и `X-Accel-Redirect` очищаются перед локальным Python backend.
 - Для подписок включены `Cache-Control: no-store`, `X-Robots-Tag: noindex, nofollow` и `Content-Security-Policy: default-src 'none'`.
-- `/info/` использует строгий CSP без `unsafe-inline`: `style-src 'self'`.
-- `Strict-Transport-Security` включает `includeSubDomains`; оставляйте это только если все поддомены обслуживаются по HTTPS.
+- `/info/` использует строгий CSP без `unsafe-inline`: `style-src 'self'`; на `/info//dl/` продублированы `CSP`/`Permissions-Policy` (локальный `add_header` подавляет http-level).
+- Включён OCSP stapling (`ssl_stapling`/`ssl_stapling_verify`, `ssl_trusted_certificate = chain.pem`).
+- `Strict-Transport-Security` включает `includeSubDomains; preload`; оставляйте `preload` только если все поддомены обслуживаются по HTTPS (откат из preload-списка долгий).
 
 ---
 

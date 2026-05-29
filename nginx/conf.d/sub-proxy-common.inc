@@ -11,6 +11,10 @@
 limit_req zone=one burst=5 nodelay;
 client_max_body_size 1k;
 
+# Тело подписки содержит секреты клиента (UUID, reality-ключи).
+# Отключаем сжатие как defense-in-depth против compression side-channel.
+gzip off;
+
 proxy_pass http://127.0.0.1:9080;
 
 proxy_http_version 1.1;
