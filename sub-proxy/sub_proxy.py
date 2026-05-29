@@ -332,12 +332,27 @@ class ServerConfig:
 
 
 def _parse_port_map(raw: str) -> dict[str, str]:
-    """Парсинг строки маппинга портов 'src:dst,src:dst'."""
-    result = {}
-    if raw:
-        for pair in raw.split(","):
-            src, dst = pair.strip().split(":")
-            result[src.strip()] = dst.strip()
+    """Парсинг строки маппинга портов 'src:dst,src:dst'.
+
+    Пустые сегменты (например хвостовая запятая `443:8443,`) игнорируются.
+    При неверном формате — fail-fast с понятным сообщением, где назван PORT_MAP
+    и проблемная пара: иначе сервис уходит в systemd restart-loop с непрозрачным
+    'ValueError: too many values to unpack'.
+    """
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        if (len(parts) != 2
+                or not parts[0].strip().isdigit()
+                or not parts[1].strip().isdigit()):
+            raise ValueError(
+                f"Некорректная пара в PORT_MAP: {pair!r} "
+                f"(ожидается 'src:dst' из чисел, например '443:8443')"
+            )
+        result[parts[0].strip()] = parts[1].strip()
     return result
 
 
