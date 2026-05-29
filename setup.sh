@@ -85,6 +85,7 @@ if [[ -n "${SERVERS:-}" ]]; then
     IFS=',' read -ra SERVER_LIST <<< "${SERVERS}"
     for name in "${SERVER_LIST[@]}"; do
         name="$(echo "$name" | tr '[:lower:]' '[:upper:]' | xargs)"
+        [[ -z "$name" ]] && continue   # пропускаем пустые элементы (напр. хвостовая запятая)
         prefix="${name}_"
 
         url_var="${prefix}XUI_SUB_BASE_URL"
@@ -187,6 +188,7 @@ if [[ -n "${SERVERS:-}" ]]; then
     echo "Ссылки подписки для клиентов:"
     for name in "${SERVER_LIST[@]}"; do
         name="$(echo "$name" | tr '[:lower:]' '[:upper:]' | xargs)"
+        [[ -z "$name" ]] && continue   # пропускаем пустые элементы (напр. хвостовая запятая)
         path_var="${name}_PATH_PREFIX"
         relay_var="${name}_RELAY_ADDRESS"
         relay_port_var="${name}_RELAY_PORT"
